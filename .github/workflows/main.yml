@@ -71,8 +71,8 @@ jobs:
         fi
 
         script_path="scripts/filedrop.py"
-        if [ ! -f "$script_path" ] && [ -f "Abc/scripts/filedrop.py" ]; then
-          script_path="Abc/scripts/filedrop.py"
+        if [ ! -f "$script_path" ] && [ -f "scripts/filedrop.py" ]; then
+          script_path="scripts/filedrop.py"
         fi
         if [ ! -f "$script_path" ]; then
           echo "filedrop.py tidak ditemukan."
