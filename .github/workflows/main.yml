@@ -35,6 +35,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Import rclone.conf from secret
+        shell: bash
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RCLONE_CONF:-}" ]]; then
+            echo "Secret RCLONE_CONF kosong atau belum dibuat."
+            exit 1
+          fi
+          mkdir -p "${HOME}/.config/rclone"
+          printf '%s' "${RCLONE_CONF}" > "${HOME}/.config/rclone/rclone.conf"
+          chmod 600 "${HOME}/.config/rclone/rclone.conf"
+          rclone config file
+          rclone listremotes || true
+
       - name: Upload via filedrop.py
         shell: bash
         env:
