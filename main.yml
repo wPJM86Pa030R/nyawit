@@ -1,0 +1,52 @@
+name: FileDrop Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Path file/folder/wildcard. Contoh: uploads/* atau uploads/**/*.mp4"
+        required: true
+        default: "uploads/*"
+      recursive:
+        description: "Jika source folder, scan subfolder juga"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Upload to MediaFire
+        shell: bash
+        env:
+          MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
+        run: |
+          set -euo pipefail
+          script_path="scripts/filedrop.py"
+          if [[ ! -f "${script_path}" && -f "Abc/scripts/filedrop.py" ]]; then
+            script_path="Abc/scripts/filedrop.py"
+          fi
+          if [[ ! -f "${script_path}" ]]; then
+            echo "filedrop.py tidak ditemukan."
+            exit 1
+          fi
+
+          cmd=(python "${script_path}" "${{ github.event.inputs.source }}")
+          if [[ "${{ github.event.inputs.recursive }}" != "true" ]]; then
+            cmd+=("--no-recursive")
+          fi
+          "${cmd[@]}"
