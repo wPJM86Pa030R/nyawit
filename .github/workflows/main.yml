@@ -16,6 +16,9 @@ jobs:
       FILEDROP_DRY_RUN: ${{ secrets.FILEDROP_DRY_RUN }}
 
     steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
     - name: Download ngrok
       run: |
         wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
@@ -70,12 +73,18 @@ jobs:
           exit 1
         fi
 
-        script_path="scripts/filedrop.py"
-        if [ ! -f "$script_path" ] && [ -f "scripts/filedrop.py" ]; then
-          script_path="scripts/filedrop.py"
-        fi
-        if [ ! -f "$script_path" ]; then
+        script_path=""
+        for candidate in "scripts/filedrop.py" "scripts/filedrop.py"; do
+          if [ -f "$candidate" ]; then
+            script_path="$candidate"
+            break
+          fi
+        done
+
+        if [ -z "$script_path" ]; then
           echo "filedrop.py tidak ditemukan."
+          echo "Current directory: $(pwd)"
+          find . -maxdepth 4 -name "filedrop.py" -print || true
           exit 1
         fi
 
