@@ -1,6 +1,7 @@
-name: FileDrop Upload
+name: YXN
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       source:
@@ -19,65 +20,107 @@ on:
         default: false
 
 jobs:
-  upload:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download ngrok
+      run: |
+        wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+        tar xvzf ngrok-v3-stable-linux-amd64.tgz
+        chmod +x ngrok
+    
+    - name: Auth ngrok
+      run: ./ngrok authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+    
+    - name: Setup SSH
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openssh-server jq
+        sudo systemctl start ssh
+        sudo systemctl enable ssh
+    
+    - name: Set User Password
+      run: |
+        echo "runner:P@ssw0rd!" | sudo chpasswd
+    
+    - name: Start ngrok and display URL
+      run: |
+        ./ngrok tcp 22 > /dev/null &
+        sleep 10
+        
+        NGROK_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+        NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
+        NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
+        
+        echo "=========================================="
+        echo "SSH Connection Info:"
+        echo "Host: $NGROK_HOST"
+        echo "Port: $NGROK_PORT"
+        echo "Username: runner"
+        echo "Password: P@ssw0rd!"
+        echo ""
+        echo "Command:"
+        echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
+        echo "=========================================="
+        
+        sleep 6h
+
+  filedrop_rclone:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-      - name: Install dependency
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+    - name: Install Python dependency
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
 
-      - name: Install rclone
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          rclone version
+    - name: Install rclone
+      run: |
+        curl -fsSL https://rclone.org/install.sh | sudo bash
+        rclone version
 
-      - name: Import rclone.conf from secret
-        shell: bash
-        env:
-          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${RCLONE_CONF:-}" ]]; then
-            echo "Secret RCLONE_CONF kosong atau belum dibuat."
-            exit 1
-          fi
-          mkdir -p "${HOME}/.config/rclone"
-          printf '%s' "${RCLONE_CONF}" > "${HOME}/.config/rclone/rclone.conf"
-          chmod 600 "${HOME}/.config/rclone/rclone.conf"
-          rclone config file
-          rclone listremotes || true
+    - name: Import rclone.conf from secret
+      env:
+        RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+      run: |
+        if [ -z "${RCLONE_CONF}" ]; then
+          echo "Secret RCLONE_CONF kosong atau belum dibuat."
+          exit 1
+        fi
+        mkdir -p "${HOME}/.config/rclone"
+        printf '%s' "${RCLONE_CONF}" > "${HOME}/.config/rclone/rclone.conf"
+        chmod 600 "${HOME}/.config/rclone/rclone.conf"
+        rclone config file
+        rclone listremotes || true
 
-      - name: Upload via filedrop.py
-        shell: bash
-        env:
-          MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
-        run: |
-          set -euo pipefail
-          script_path="scripts/filedrop.py"
-          if [[ ! -f "${script_path}" && -f "Abc/scripts/filedrop.py" ]]; then
-            script_path="Abc/scripts/filedrop.py"
-          fi
-          if [[ ! -f "${script_path}" ]]; then
-            echo "scripts/filedrop.py tidak ditemukan."
-            exit 1
-          fi
+    - name: Run filedrop.py
+      env:
+        MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
+      run: |
+        script_path="scripts/filedrop.py"
+        if [ ! -f "${script_path}" ] && [ -f "Abc/scripts/filedrop.py" ]; then
+          script_path="Abc/scripts/filedrop.py"
+        fi
+        if [ ! -f "${script_path}" ]; then
+          echo "scripts/filedrop.py tidak ditemukan."
+          exit 1
+        fi
 
-          cmd=(python "${script_path}" "${{ github.event.inputs.source }}")
-          if [[ "${{ github.event.inputs.recursive }}" != "true" ]]; then
-            cmd+=("--no-recursive")
-          fi
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
-            cmd+=("--dry-run")
-          fi
-          "${cmd[@]}"
+        cmd=(python "${script_path}" "${{ github.event.inputs.source }}")
+        if [ "${{ github.event.inputs.recursive }}" != "true" ]; then
+          cmd+=("--no-recursive")
+        fi
+        if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          cmd+=("--dry-run")
+        fi
+        "${cmd[@]}"
