@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: true
+      dry_run:
+        description: "Jika true, hanya cek file tanpa upload"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   upload:
@@ -30,7 +35,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Upload to MediaFire
+      - name: Upload via filedrop.py
         shell: bash
         env:
           MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
@@ -41,12 +46,15 @@ jobs:
             script_path="Abc/scripts/filedrop.py"
           fi
           if [[ ! -f "${script_path}" ]]; then
-            echo "filedrop.py tidak ditemukan."
+            echo "scripts/filedrop.py tidak ditemukan."
             exit 1
           fi
 
           cmd=(python "${script_path}" "${{ github.event.inputs.source }}")
           if [[ "${{ github.event.inputs.recursive }}" != "true" ]]; then
             cmd+=("--no-recursive")
+          fi
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            cmd+=("--dry-run")
           fi
           "${cmd[@]}"
