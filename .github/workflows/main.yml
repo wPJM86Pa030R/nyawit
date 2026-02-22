@@ -38,7 +38,7 @@ jobs:
     - name: Setup Rclone Config
       run: |
         mkdir -p /home/runner/.config/rclone
-        echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
+        sudo echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
         sudo chown -R runner:runner /home/runner/.config
         
     - name: Set User Password
