@@ -1,20 +1,23 @@
 #!/bin/bash
 
-# =============================================
-# FILEDROP TOKEN (ISI DENGAN TOKEN ANDA)
-# =============================================
-TOKEN="abcdefghijklmnopqrstuvwxyz123456"   # Ganti dengan token asli Anda
-# =============================================
+# Script: upload_mediafire_env.sh
+# Mengunggah file ke MediaFire via filedrop dengan token dari environment variable
+
+# Cek apakah environment variable FILEDROP_TOKEN sudah diset
+if [ -z "$FILEDROP_TOKEN" ]; then
+    echo "❌ Environment variable FILEDROP_TOKEN belum diset."
+    echo "   Jalankan: export FILEDROP_TOKEN='token_anda_disini'"
+    exit 1
+fi
 
 # Tampilkan cara penggunaan jika tidak ada argumen
 if [ $# -eq 0 ]; then
     echo "Penggunaan: $0 <pola-wildcard>"
-    echo "Contoh: $0 '*.txt'  atau  $0 '*1.txt'"
+    echo "Contoh: $0 '*.txt'"
     exit 1
 fi
 
 pattern="$1"
-
 shopt -s nullglob
 files=($pattern)
 
@@ -26,10 +29,9 @@ fi
 for file in "${files[@]}"; do
     if [ -f "$file" ]; then
         echo "Mengunggah: $file ..."
-        
-        # Gunakan token dengan parameter --token (sesuaikan dengan perintah filedrop Anda)
-        filedrop upload "$file" --token "$TOKEN"
-        
+        # Gunakan token dari environment variable
+        # Sesuaikan parameter dengan tool filedrop Anda
+        filedrop upload "$file" --token "$FILEDROP_TOKEN"
         if [ $? -eq 0 ]; then
             echo "✅ Berhasil: $file"
         else
