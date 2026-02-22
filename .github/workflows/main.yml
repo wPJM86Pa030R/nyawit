@@ -47,10 +47,6 @@ jobs:
     
     - name: Copy filedrop.sh to /scripts
       run: |
-        if [ -z "$FILEDROP_KEY" ]; then
-          echo "::warning::FILEDROP_KEY secret is empty"
-        fi
-        # Buat direktori scripts
         sudo mkdir -p ~/scripts
         
         # Copy filedrop.sh dari repository (sesuaikan path-nya)
@@ -58,7 +54,8 @@ jobs:
           sudo cp scripts/filedrop.sh ~/scripts/
           echo "Filedrop.sh berhasil di-copy dari repository"
         fi
-        
+
+        sed 's/DEFAULT_FILEDROP_KEY=""/DEFAULT_FILEDROP_KEY="$FILEDROP_KEY"/' ~/scripts/filedrop.sh
         sudo chmod +x ~/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
