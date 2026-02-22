@@ -54,10 +54,9 @@ jobs:
           sudo cp scripts/filedrop.sh ~/scripts/
           echo "Filedrop.sh berhasil di-copy dari repository"
         fi
-
-        sed 's/DEFAULT_FILEDROP_KEY=""/DEFAULT_FILEDROP_KEY="$FILEDROP_KEY"/' ~/scripts/filedrop.sh
+        
         sudo chmod +x ~/scripts/filedrop.sh
-    
+        
     - name: Start ngrok and display URL
       run: |
         ./ngrok tcp 22 > /dev/null &
