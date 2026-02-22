@@ -1,6 +1,6 @@
 name: YXN
 
-on: [push, workflow_dispatch]
+#on: [push, workflow_dispatch]
 
 jobs:
   build:
