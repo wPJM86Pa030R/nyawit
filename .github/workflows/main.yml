@@ -1,4 +1,4 @@
-name: Pyrogram
+name: Pyrogram x Tele User_Bot x Rclone
 
 on: [push, workflow_dispatch]
 
@@ -60,14 +60,13 @@ jobs:
         echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
         sudo chown -R runner:runner /home/runner/.config
 
-    - name: Start Pyrogram Downloader
     - name: Setup Variable Environments
       run: |
         mkdir -p ~/scripts
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
         wget -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
         chmod +x ~/scripts/filedrop.js
-        rm ~/filedrop_key.txt
+        rm ~/scripts/filedrop_key.txt
 
     - name: Start Pyrogram Downloader
       run: |
