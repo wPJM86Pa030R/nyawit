@@ -6,26 +6,23 @@ POLL_UPLOAD_ENDPOINT="https://www.mediafire.com/api/1.5/upload/poll_upload.php"
 POLL_UPLOAD_ENDPOINT_FALLBACK="https://www.mediafire.com/api/1.4/upload/poll_upload.php"
 GET_LINKS_ENDPOINT="https://www.mediafire.com/api/1.5/file/get_links.php"
 # Isi key FileDrop default di sini jika tidak ingin set via env/argumen.
-DEFAULT_FILEDROP_KEY="219706aee26bd55019e313c7f09de308ac4e6d4eed5f664d82e69b8db3fe71d5"
+DEFAULT_FILEDROP_KEY=""
 
 usage() {
   cat <<'EOF'
 MediaFire FileDrop uploader
 
 Usage:
-  filedrop.sh --file <path-or-glob> [--file <path-or-glob> ...] [options]
-  filedrop.sh <path-or-glob> [more files/patterns ...] [options]
+  filedrop.sh --file <path-or-glob> [options]
+  filedrop.sh <path-or-glob> [options]
 
 Contoh:
   FILEDROP_KEY=xxxx ./scripts/filedrop.sh "./dist/*.zip"
-  FILEDROP_KEY=xxxx ./scripts/filedrop.sh dist/*.zip logs/*.txt
   FILEDROP_KEY=xxxx ./scripts/filedrop.sh --file "./build/*.apk" --action replace
-  FILEDROP_KEY=xxxx ./scripts/filedrop.sh --recursive "/home/runner/uploads/"
 
 Options:
-  -f, --file <path-or-glob>  File/pattern yang di-upload (bisa diulang).
+  -f, --file <path-or-glob>  File/pattern yang di-upload (wajib 1 file cocok).
   -k, --filedrop-key <key>   FileDrop key MediaFire.
-  -r, --recursive            Jika input folder, upload semua file di subfolder juga.
       --path <path>          Tujuan path di FileDrop (opsional).
       --action <mode>        Aksi duplikat: skip|keep|replace.
       --poll-interval <sec>  Jeda polling status upload. Default: 3.
@@ -96,64 +93,45 @@ file_sha256() {
   die "Butuh sha256sum atau shasum."
 }
 
-declare -a FILE_SPECS=()
-declare -a UPLOAD_FILES=()
-declare -A SEEN_FILES=()
+FILE_SPEC=""
+UPLOAD_FILE=""
 
 FILEDROP_KEY="${FILEDROP_KEY:-${MEDIAFIRE_FILEDROP_KEY:-$DEFAULT_FILEDROP_KEY}}"
 DEST_PATH=""
 ACTION_ON_DUPLICATE=""
 POLL_INTERVAL=3
 TIMEOUT_SECONDS=300
-RECURSIVE=0
 
-add_upload_file() {
-  local file="$1"
-  if [[ -n "${SEEN_FILES["$file"]+x}" ]]; then
-    return
-  fi
-  SEEN_FILES["$file"]=1
-  UPLOAD_FILES+=("$file")
-}
-
-expand_spec() {
+expand_single_spec() {
   local spec="$1"
-  local matched=0
   local search_spec="$spec"
+  local -a matches=()
   local match=""
 
   if [[ -d "$search_spec" ]]; then
-    if (( RECURSIVE == 1 )); then
-      while IFS= read -r -d '' match; do
-        [[ -f "$match" ]] || continue
-        add_upload_file "$match"
-        matched=1
-      done < <(find "$search_spec" -type f -print0)
-
-      if (( matched == 0 )); then
-        return 1
-      fi
-      return 0
-    fi
-
     search_spec="${search_spec%/}/*"
   fi
 
   if [[ -f "$search_spec" ]]; then
-    add_upload_file "$search_spec"
+    UPLOAD_FILE="$search_spec"
     return 0
   fi
 
   while IFS= read -r match; do
     [[ -n "$match" ]] || continue
     [[ -f "$match" ]] || continue
-    add_upload_file "$match"
-    matched=1
+    matches+=("$match")
   done < <(compgen -G "$search_spec" || true)
 
-  if (( matched == 0 )); then
+  if (( ${#matches[@]} == 0 )); then
     return 1
   fi
+  if (( ${#matches[@]} > 1 )); then
+    die "Pattern cocok lebih dari 1 file. Gunakan wildcard yang lebih spesifik: $spec"
+  fi
+
+  UPLOAD_FILE="${matches[0]}"
+  return 0
 }
 
 upload_one_file() {
@@ -257,17 +235,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--file)
       [[ $# -ge 2 ]] || die "Nilai untuk $1 belum diisi."
-      FILE_SPECS+=("$2")
+      [[ -z "$FILE_SPEC" ]] || die "Hanya boleh satu --file/pattern."
+      FILE_SPEC="$2"
       shift 2
       ;;
     -k|--filedrop-key)
       [[ $# -ge 2 ]] || die "Nilai untuk $1 belum diisi."
       FILEDROP_KEY="$2"
       shift 2
-      ;;
-    -r|--recursive)
-      RECURSIVE=1
-      shift
       ;;
     --path)
       [[ $# -ge 2 ]] || die "Nilai untuk $1 belum diisi."
@@ -297,13 +272,14 @@ while [[ $# -gt 0 ]]; do
       die "Opsi tidak dikenali: $1"
       ;;
     *)
-      FILE_SPECS+=("$1")
+      [[ -z "$FILE_SPEC" ]] || die "Hanya boleh satu file/pattern."
+      FILE_SPEC="$1"
       shift
       ;;
   esac
 done
 
-[[ ${#FILE_SPECS[@]} -gt 0 ]] || {
+[[ -n "$FILE_SPEC" ]] || {
   usage
   die "File atau pattern belum ditentukan."
 }
@@ -324,17 +300,10 @@ require_cmd head
 require_cmd awk
 require_cmd wc
 require_cmd compgen
-require_cmd find
 
-for spec in "${FILE_SPECS[@]}"; do
-  if ! expand_spec "$spec"; then
-    die "Pattern tidak cocok file apa pun: $spec"
-  fi
-done
+if ! expand_single_spec "$FILE_SPEC"; then
+  die "Pattern tidak cocok file apa pun: $FILE_SPEC"
+fi
 
-[[ ${#UPLOAD_FILES[@]} -gt 0 ]] || die "Tidak ada file yang bisa di-upload."
-
-echo "Total file yang akan di-upload: ${#UPLOAD_FILES[@]}"
-for upload_file in "${UPLOAD_FILES[@]}"; do
-  upload_one_file "$upload_file"
-done
+echo "File yang akan di-upload: $UPLOAD_FILE"
+upload_one_file "$UPLOAD_FILE"
