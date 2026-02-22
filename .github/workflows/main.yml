@@ -9,7 +9,7 @@ jobs:
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-      DEFAULT_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+      X_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -56,6 +56,7 @@ jobs:
         fi
         
         sudo chmod +x ~/scripts/filedrop.sh
+        sed -i "s/DEFAULT_FILEDROP_KEY=\"\"/DEFAULT_FILEDROP_KEY=\"$X_FILEDROP_KEY\"/" /home/runner/scripts/filedrop.sh
         
     - name: Start ngrok and display URL
       run: |
