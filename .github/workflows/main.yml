@@ -1,6 +1,6 @@
 name: Pyrogram x Tele User_Bot x Rclone
 
-#on: [push, workflow_dispatch]
+on: [push, workflow_dispatch]
 
 jobs:
   build:
