@@ -38,14 +38,11 @@ jobs:
         
         # Copy filedrop.sh dari repository (sesuaikan path-nya)
         if [ -f "scripts/filedrop.sh" ]; then
-          sudo cp scripts/filedrop.sh /scripts/
+          sudo cp scripts/filedrop.sh ~/scripts/
           echo "Filedrop.sh berhasil di-copy dari repository"
         fi
         
-        sudo chmod +x /scripts/filedrop.sh
-        
-        echo "Isi filedrop.sh:"
-        cat /scripts/filedrop.sh
+        sudo chmod +x ~/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
       run: |
