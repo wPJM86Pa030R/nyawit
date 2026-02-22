@@ -49,7 +49,7 @@ jobs:
       run: |
         mkdir -p ~/scripts
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
-        wget -P ~/scripts/filedrop_key.js -i ~/filedrop_key.txt
+        wget -P ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
     
     - name: Start ngrok and display URL
       run: |
