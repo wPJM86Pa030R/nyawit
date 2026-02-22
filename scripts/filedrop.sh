@@ -5,7 +5,7 @@ UPLOAD_SIMPLE_ENDPOINT="https://www.mediafire.com/api/upload/simple.php"
 POLL_UPLOAD_ENDPOINT="https://www.mediafire.com/api/1.4/upload/poll_upload.php"
 GET_LINKS_ENDPOINT="https://www.mediafire.com/api/1.4/file/get_links.php"
 # Isi key FileDrop default di sini jika tidak ingin set via env/argumen.
-DEFAULT_FILEDROP_KEY=""
+DEFAULT_FILEDROP_KEY="219706aee26bd55019e313c7f09de308ac4e6d4eed5f664d82e69b8db3fe71d5"
 
 usage() {
   cat <<'EOF'
