@@ -6,7 +6,9 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-
+    environment: production
+    env:
+      RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
