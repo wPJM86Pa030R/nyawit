@@ -34,7 +34,7 @@ jobs:
     - name: Copy filedrop.sh to /scripts
       run: |
         # Buat direktori scripts
-        sudo mkdir -p /scripts
+        sudo mkdir -p ~/scripts
         
         # Copy filedrop.sh dari repository (sesuaikan path-nya)
         if [ -f "scripts/filedrop.sh" ]; then
