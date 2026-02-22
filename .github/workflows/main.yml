@@ -1,106 +1,130 @@
 name: YXN
 
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-    
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Download ngrok
-      run: |
-        wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
-        tar xvzf ngrok-v3-stable-linux-amd64.tgz
-        chmod +x ngrok
-    
-    - name: Auth ngrok
-      run: ./ngrok authtoken ${{ secrets.NGROK_AUTHTOKEN }}
-    
-    - name: Setup SSH
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openssh-server jq
-        sudo systemctl start ssh
-        sudo systemctl enable ssh
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        wget -O bclone.zip https://github.com/BenjiThatFoxGuy/bclone/releases/download/v1.73.1/rclone-v1.73.1-linux-amd64.zip
-        unzip -o bclone.zip
-        sudo install -m 755 rclone-v1.73.1-linux-amd64/rclone /usr/local/bin/rclone
-        rclone version
-    
-    - name: Setup Rclone Config
-      run: |
-        mkdir -p /home/runner/.config/rclone
-        echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
-        sudo chown -R runner:runner /home/runner/.config
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server jq unzip
 
-    - name: Validate FileDrop key
-      if: ${{ hashFiles('dist/*.zip') != '' }}
-      env:
-        FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
-        DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
-      run: |
-        if [ -z "$FILEDROP_KEY" ] && [ -z "$DEFAULT_FILEDROP_KEY" ]; then
-          echo "Error: Secret FILEDROP_KEY dan variable default_drop_key kosong."
-          exit 1
-        fi
+      - name: Download ngrok
+        run: |
+          wget -O ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar xvzf ngrok.tgz
+          chmod +x ngrok
 
-    - name: Upload dist zip to FileDrop
-      if: ${{ hashFiles('dist/*.zip') != '' }}
-      env:
-        FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
-        DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
-      run: bash ./scripts/filedrop.sh "./dist/*.zip"
+      - name: Auth ngrok
+        run: ./ngrok authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
 
-    - name: Skip FileDrop upload if dist zip not found
-      if: ${{ hashFiles('dist/*.zip') == '' }}
-      run: echo "Tidak ada file ./dist/*.zip, upload FileDrop dilewati."
-      
-    - name: Set User Password
-      run: |
-        echo "runner:P@ssw0rd!" | sudo chpasswd
-    
-    - name: Copy filedrop.sh to /scripts
-      run: |
-        sudo mkdir -p ~/scripts
-        
-        # Copy filedrop.sh dari repository (sesuaikan path-nya)
-        if [ -f "scripts/filedrop.sh" ]; then
-          sudo cp scripts/filedrop.sh ~/scripts/
-          echo "Filedrop.sh berhasil di-copy dari repository"
-        fi
-        
-        sudo chmod +x ~/scripts/filedrop.sh
-        sudo sed -i "s/DEFAULT_FILEDROP_KEY=\"\"/DEFAULT_FILEDROP_KEY=\"$X_FILEDROP_KEY\"/" /home/runner/scripts/filedrop.sh
-        
-    - name: Start ngrok and display URL
-      run: |
-        ./ngrok tcp 22 > /dev/null &
-        sleep 10
-        
-        NGROK_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')
-        NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
-        NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
-        
-        echo "=========================================="
-        echo "SSH Connection Info:"
-        echo "Host: $NGROK_HOST"
-        echo "Port: $NGROK_PORT"
-        echo "Username: runner"
-        echo "Password: P@ssw0rd!"
-        echo ""
-        echo "Command:"
-        echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
-        echo ""
-        echo "File script tersedia di: /scripts/file.sh"
-        echo "Jalankan dengan: bash /scripts/file.sh"
-        echo "=========================================="
-        
-        sleep 6h
+      - name: Install bclone (rclone)
+        run: |
+          wget -O bclone.zip https://github.com/BenjiThatFoxGuy/bclone/releases/download/v1.73.1/rclone-v1.73.1-linux-amd64.zip
+          unzip -o bclone.zip
+          sudo install -m 755 rclone-v1.73.1-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version
+
+      - name: Setup Rclone Config
+        if: ${{ env.RCLONE_CONF != '' }}
+        run: |
+          mkdir -p /home/runner/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
+          sudo chown -R runner:runner /home/runner/.config
+
+      - name: Validate FileDrop key
+        if: ${{ hashFiles('dist/*.zip') != '' }}
+        env:
+          FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+          DEFAULT_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+        run: |
+          if [ -z "$FILEDROP_KEY" ] && [ -z "$DEFAULT_FILEDROP_KEY" ]; then
+            echo "Error: Secret FILEDROP_KEY dan variable default_drop_key kosong."
+            exit 1
+          fi
+
+      - name: Upload dist zip to FileDrop
+        if: ${{ hashFiles('dist/*.zip') != '' }}
+        env:
+          FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+          DEFAULT_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+        run: bash ./scripts/filedrop.sh "./dist/*.zip"
+
+      - name: Skip FileDrop upload if dist zip not found
+        if: ${{ hashFiles('dist/*.zip') == '' }}
+        run: echo "Tidak ada file ./dist/*.zip, upload FileDrop dilewati."
+
+      - name: Configure SSH user
+        run: |
+          echo "runner:P@ssw0rd!" | sudo chpasswd
+          sudo sed -Ei 's/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+      - name: Copy filedrop.sh to /home/runner/scripts
+        env:
+          DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
+        run: |
+          mkdir -p /home/runner/scripts
+
+          if [ ! -f "scripts/filedrop.sh" ]; then
+            echo "Error: scripts/filedrop.sh tidak ditemukan."
+            exit 1
+          fi
+
+          cp scripts/filedrop.sh /home/runner/scripts/filedrop.sh
+          chmod +x /home/runner/scripts/filedrop.sh
+
+          # Agar script bisa jalan langsung via SSH tanpa wajib set FILEDROP_KEY.
+          if [ -n "$DEFAULT_FILEDROP_KEY" ]; then
+            printf '%s' "$DEFAULT_FILEDROP_KEY" > /home/runner/scripts/.default_filedrop_key
+            chmod 600 /home/runner/scripts/.default_filedrop_key
+            echo "Default FileDrop key disimpan di /home/runner/scripts/.default_filedrop_key"
+          else
+            echo "vars.default_drop_key kosong. Script tetap bisa dipakai dengan FILEDROP_KEY manual."
+          fi
+
+          sed -i 's|^DEFAULT_FILEDROP_KEY=.*$|DEFAULT_FILEDROP_KEY="${DEFAULT_FILEDROP_KEY:-$(cat /home/runner/scripts/.default_filedrop_key 2>/dev/null || true)}"|' /home/runner/scripts/filedrop.sh
+
+      - name: Start ngrok and display URL
+        run: |
+          ./ngrok tcp 22 > /dev/null &
+          sleep 10
+
+          NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
+          if [ -z "$NGROK_URL" ] || [ "$NGROK_URL" = "null" ]; then
+            echo "Error: Gagal mendapatkan URL ngrok."
+            exit 1
+          fi
+
+          NGROK_HOST="$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f1)"
+          NGROK_PORT="$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f2)"
+
+          echo "=========================================="
+          echo "SSH Connection Info:"
+          echo "Host: $NGROK_HOST"
+          echo "Port: $NGROK_PORT"
+          echo "Username: runner"
+          echo "Password: P@ssw0rd!"
+          echo ""
+          echo "Command:"
+          echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
+          echo ""
+          echo "File script tersedia di: /home/runner/scripts/filedrop.sh"
+          echo "Contoh upload manual (langsung jalan jika vars.default_drop_key terisi):"
+          echo "cd \"$GITHUB_WORKSPACE\" && bash /home/runner/scripts/filedrop.sh \"./dist/*.zip\""
+          echo "Jika vars.default_drop_key belum diisi:"
+          echo "FILEDROP_KEY='<KEY>' bash /home/runner/scripts/filedrop.sh \"./dist/*.zip\""
+          echo "=========================================="
+
+          sleep 6h
