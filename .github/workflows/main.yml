@@ -27,7 +27,10 @@ jobs:
         sudo systemctl start ssh
         sudo systemctl enable ssh
 
-        sudo -v ; curl https://rclone.org/install.sh | sudo bash
+        wget -O bclone.zip https://github.com/BenjiThatFoxGuy/bclone/releases/download/v1.73.1/rclone-v1.73.1-linux-amd64.zip
+        unzip -o bclone.zip
+        sudo install -m 755 rclone-v1.73.1-linux-amd64/rclone /usr/local/bin/rclone
+        rclone version
     
     - name: Setup Rclone Config
       run: |
