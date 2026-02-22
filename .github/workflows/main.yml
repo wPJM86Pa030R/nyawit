@@ -9,6 +9,7 @@ jobs:
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+      FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
