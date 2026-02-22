@@ -2,8 +2,9 @@
 set -euo pipefail
 
 UPLOAD_SIMPLE_ENDPOINT="https://www.mediafire.com/api/upload/simple.php"
-POLL_UPLOAD_ENDPOINT="https://www.mediafire.com/api/1.4/upload/poll_upload.php"
-GET_LINKS_ENDPOINT="https://www.mediafire.com/api/1.4/file/get_links.php"
+POLL_UPLOAD_ENDPOINT="https://www.mediafire.com/api/1.5/upload/poll_upload.php"
+POLL_UPLOAD_ENDPOINT_FALLBACK="https://www.mediafire.com/api/1.4/upload/poll_upload.php"
+GET_LINKS_ENDPOINT="https://www.mediafire.com/api/1.5/file/get_links.php"
 # Isi key FileDrop default di sini jika tidak ingin set via env/argumen.
 DEFAULT_FILEDROP_KEY="219706aee26bd55019e313c7f09de308ac4e6d4eed5f664d82e69b8db3fe71d5"
 
@@ -65,6 +66,21 @@ url_encode() {
 xml_first() {
   local tag="$1"
   sed -n "s:.*<${tag}>\\([^<]*\\)</${tag}>.*:\\1:p" | head -n1
+}
+
+xml_first_any() {
+  local xml="$1"
+  shift
+  local tag=""
+  local value=""
+  for tag in "$@"; do
+    value="$(printf '%s' "$xml" | xml_first "$tag")"
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 1
 }
 
 file_sha256() {
@@ -145,7 +161,7 @@ upload_one_file() {
   local filename size hash
   local query upload_url
   local upload_resp upload_key
-  local poll_resp status desc quickkey fileerror
+  local poll_resp poll_resp_fallback status desc quickkey fileerror
   local links_resp normal_dl view_link
   local deadline
 
@@ -191,7 +207,7 @@ upload_one_file() {
     )"
     status="$(printf '%s' "$poll_resp" | xml_first status)"
     desc="$(printf '%s' "$poll_resp" | xml_first description)"
-    quickkey="$(printf '%s' "$poll_resp" | xml_first quickkey)"
+    quickkey="$(xml_first_any "$poll_resp" quickkey quick_key || true)"
     fileerror="$(printf '%s' "$poll_resp" | xml_first fileerror)"
 
     echo "status=${status:-unknown} | ${desc:-}"
@@ -200,8 +216,21 @@ upload_one_file() {
       die "Upload gagal untuk '$file' (fileerror=$fileerror)."
     fi
 
-    if [[ "$status" == "99" && -n "$quickkey" ]]; then
-      break
+    if [[ "$status" == "99" ]]; then
+      if [[ -n "$quickkey" ]]; then
+        break
+      fi
+
+      poll_resp_fallback="$(
+        curl -sS --fail \
+          "${POLL_UPLOAD_ENDPOINT_FALLBACK}?key=$(url_encode "$upload_key")&response_format=xml"
+      )"
+      quickkey="$(xml_first_any "$poll_resp_fallback" quickkey quick_key || true)"
+      if [[ -n "$quickkey" ]]; then
+        break
+      fi
+
+      die "Upload selesai (status=99) tapi quickkey kosong. Response: ${desc:-No description}"
     fi
 
     if (( SECONDS >= deadline )); then
