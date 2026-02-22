@@ -45,7 +45,7 @@ jobs:
         sudo chmod +x ~/scripts/filedrop.sh
         
         echo "Isi filedrop.sh:"
-        cat /scripts/filedrop.sh
+        cat ~/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
       run: |
