@@ -1,21 +1,6 @@
 name: YXN
 
-on:
-  push:
-  workflow_dispatch:
-    inputs:
-      filedrop_file:
-        description: "Path file di repo yang akan di-upload"
-        required: false
-        default: ""
-      filedrop_path:
-        description: "Path tujuan di FileDrop (opsional)"
-        required: false
-        default: ""
-      filedrop_action:
-        description: "Aksi jika file sudah ada: skip|keep|replace"
-        required: false
-        default: "skip"
+on: [push, workflow_dispatch]
 
 jobs:
   build:
@@ -24,8 +9,8 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
-
+      uses: actions/checkout@v3
+    
     - name: Download ngrok
       run: |
         wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
@@ -45,34 +30,23 @@ jobs:
     - name: Set User Password
       run: |
         echo "runner:P@ssw0rd!" | sudo chpasswd
-
-    - name: Upload file via MediaFire FileDrop (optional)
-      if: ${{ github.event.inputs.filedrop_file }}
-      env:
-        FILEDROP_FILE: ${{ github.event.inputs.filedrop_file }}
-        FILEDROP_PATH: ${{ github.event.inputs.filedrop_path }}
-        FILEDROP_ACTION: ${{ github.event.inputs.filedrop_action }}
-        MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
+    
+    - name: Copy filedrop.sh to /scripts
       run: |
-        set -euo pipefail
-
-        if [ -z "${MEDIAFIRE_FILEDROP_KEY}" ]; then
-          echo "Secret MEDIAFIRE_FILEDROP_KEY belum diisi."
-          exit 1
+        # Buat direktori scripts
+        sudo mkdir -p /scripts
+        
+        # Copy filedrop.sh dari repository (sesuaikan path-nya)
+        if [ -f "scripts/filedrop.sh" ]; then
+          sudo cp scripts/filedrop.sh /scripts/
+          echo "Filedrop.sh berhasil di-copy dari repository"
         fi
-
-        if [ ! -f "${FILEDROP_FILE}" ]; then
-          echo "File tidak ditemukan: ${FILEDROP_FILE}"
-          exit 1
-        fi
-
-        cmd=(bash scripts/filedrop.sh --file "${FILEDROP_FILE}" --action "${FILEDROP_ACTION}")
-        if [ -n "${FILEDROP_PATH}" ]; then
-          cmd+=(--path "${FILEDROP_PATH}")
-        fi
-
-        "${cmd[@]}"
-
+        
+        sudo chmod +x /scripts/filedrop.sh
+        
+        echo "Isi filedrop.sh:"
+        cat /scripts/filedrop.sh
+    
     - name: Start ngrok and display URL
       run: |
         ./ngrok tcp 22 > /dev/null &
@@ -91,6 +65,9 @@ jobs:
         echo ""
         echo "Command:"
         echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
+        echo ""
+        echo "File script tersedia di: /scripts/file.sh"
+        echo "Jalankan dengan: bash /scripts/file.sh"
         echo "=========================================="
         
         sleep 6h
