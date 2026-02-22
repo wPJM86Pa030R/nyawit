@@ -9,7 +9,7 @@ jobs:
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-      FILEDROP: ${{ secrets.FILEDROP_KEY }}
+      FILEDROPX: ${{ secrets.FILEDROP_KEY }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -48,7 +48,7 @@ jobs:
     - name: Create filedrop.sh
       run: |
         mkdir -p ~/scripts
-        wget -O $FILEDROP
+        wget -O "$FILEDROPX"
     
     - name: Start ngrok and display URL
       run: |
