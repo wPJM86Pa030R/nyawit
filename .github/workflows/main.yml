@@ -26,7 +26,20 @@ jobs:
         sudo apt-get install -y openssh-server jq
         sudo systemctl start ssh
         sudo systemctl enable ssh
+
+        sudo -v ; curl https://rclone.org/install.sh | sudo bash
     
+    - name: Setup Rclone Config
+      run: |
+        # Membuat folder config rclone untuk user 'runner'
+        mkdir -p /home/runner/.config/rclone
+        
+        # Memasukkan isi config dari GitHub Secrets ke file rclone.conf
+        echo "${{ secrets.RCLONE_CONF }}" > /home/runner/.config/rclone/rclone.conf
+        
+        # Mengatur hak akses agar bisa dibaca oleh user runner
+        sudo chown -R runner:runner /home/runner/.config
+        
     - name: Set User Password
       run: |
         echo "runner:P@ssw0rd!" | sudo chpasswd
@@ -43,9 +56,6 @@ jobs:
         fi
         
         sudo chmod +x ~/scripts/filedrop.sh
-        
-        echo "Isi filedrop.sh:"
-        cat ~/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
       run: |
