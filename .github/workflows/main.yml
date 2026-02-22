@@ -47,9 +47,9 @@ jobs:
     
     - name: Create filedrop.sh
       run: |
-        sudo mkdir -p ~/scripts
+        sudo mkdir -p /home/runner/scripts
         sudo echo "$FILEDROP" > /home/runner/scripts/filedrop.sh
-        sudo chmod +x ~/scripts/filedrop.sh
+        sudo chmod +x /home/runner/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
       run: |
