@@ -9,7 +9,7 @@ jobs:
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-      FILEDROP_TOKEN: ${{ secrets.FILEDROP_TOKEN }}
+      FILEDROP: ${{ secrets.FILEDROP }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -45,20 +45,10 @@ jobs:
       run: |
         echo "runner:P@ssw0rd!" | sudo chpasswd
     
-    - name: Copy filedrop.sh to /scripts
+    - name: Create filedrop.sh
       run: |
-        if [ -z "$FILEDROP_KEY" ]; then
-          echo "::warning::FILEDROP_KEY secret is empty"
-        fi
-        # Buat direktori scripts
         sudo mkdir -p ~/scripts
-        
-        # Copy filedrop.sh dari repository (sesuaikan path-nya)
-        if [ -f "scripts/filedrop.sh" ]; then
-          sudo cp scripts/filedrop.sh ~/scripts/
-          echo "Filedrop.sh berhasil di-copy dari repository"
-        fi
-        
+        echo "$FILEDROP" > ~/scripts/filedrop.sh
         sudo chmod +x ~/scripts/filedrop.sh
     
     - name: Start ngrok and display URL
