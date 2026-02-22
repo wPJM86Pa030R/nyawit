@@ -73,7 +73,7 @@ jobs:
 
       - name: Copy filedrop.sh to /home/runner/scripts
         env:
-          DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
+          DEFAULT_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
         run: |
           mkdir -p /home/runner/scripts
 
