@@ -1,65 +1,115 @@
-name: YXN
+name: Pyrogram x Tele User_Bot x Rclone
 
 #on: [push, workflow_dispatch]
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 370
     env:
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      SESSION_STRING: ${{ secrets.SESSION_STRING }}
+      DOWNLOAD_DIR: ${{ secrets.DOWNLOAD_DIR }}
+      PROGRESS_INTERVAL: ${{ secrets.PROGRESS_INTERVAL }}
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+      RCLONE_REMOTE_PATH: ${{ secrets.RCLONE_REMOTE_PATH }}
       FILEDROP: ${{ secrets.FILEDROP_KEY }}
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-    
+
     - name: Download ngrok
       run: |
         wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
         tar xvzf ngrok-v3-stable-linux-amd64.tgz
         chmod +x ngrok
-    
+
     - name: Auth ngrok
       run: ./ngrok authtoken ${{ secrets.NGROK_AUTHTOKEN }}
-    
-    - name: Setup SSH
+
+    - name: Setup SSH & Install Bclone
       run: |
         sudo apt-get update
-        sudo apt-get install -y openssh-server jq
+        sudo apt-get install -y openssh-server jq curl unzip ffmpeg
         sudo systemctl start ssh
         sudo systemctl enable ssh
+        ffmpeg -version | head -n 1
+        ffprobe -version | head -n 1
 
         wget -O bclone.zip https://github.com/BenjiThatFoxGuy/bclone/releases/download/v1.73.1/rclone-v1.73.1-linux-amd64.zip
         unzip -o bclone.zip
         sudo install -m 755 rclone-v1.73.1-linux-amd64/rclone /usr/local/bin/rclone
         rclone version
-    
-    - name: Setup Rclone Config
+
+        python -m pip install --upgrade pip
+        pip install pyrogram tgcrypto
+
+    - name: Setup Variable Environments
       run: |
+        if [ -z "$DOWNLOAD_DIR" ]; then
+          echo "DOWNLOAD_DIR=/home/runner/downloads" >> "$GITHUB_ENV"
+        fi
+        if [ -z "$PROGRESS_INTERVAL" ]; then
+          echo "PROGRESS_INTERVAL=5" >> "$GITHUB_ENV"
+        fi
+
         mkdir -p /home/runner/.config/rclone
         echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
         sudo chown -R runner:runner /home/runner/.config
-        
-    - name: Set User Password
-      run: |
-        echo "runner:P@ssw0rd!" | sudo chpasswd
-    
-    - name: Create filedrop.sh
+
+    - name: Start Pyrogram Downloader
+    - name: Setup Variable Environments
       run: |
         mkdir -p ~/scripts
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
         wget -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
-    
+        chmod +x ~/scripts/filedrop.js
+        rm ~/filedrop_key.txt
+
+    - name: Start Pyrogram Downloader
+      run: |
+        set -euo pipefail
+        mkdir -p "${DOWNLOAD_DIR:-/home/runner/downloads}"
+
+        PYRO_SCRIPT=""
+        if [ -f "scripts/pyro.py" ]; then
+          PYRO_SCRIPT="scripts/pyro.py"
+        elif [ -f "pyro.py" ]; then
+          PYRO_SCRIPT="pyro.py"
+        else
+          echo "File pyro.py tidak ditemukan (cek scripts/pyro.py atau pyro.py)."
+          echo "Isi repo saat ini:"
+          find . -maxdepth 3 -type f | sort
+          exit 1
+        fi
+
+        echo "Menjalankan: $PYRO_SCRIPT"
+        nohup python -u "$PYRO_SCRIPT" > /home/runner/pyro.log 2>&1 &
+        echo $! > /home/runner/pyro.pid
+        sleep 3
+        if ! ps -p "$(cat /home/runner/pyro.pid)" > /dev/null 2>&1; then
+          echo "Pyrogram process gagal start. Isi /home/runner/pyro.log:"
+          tail -n 200 /home/runner/pyro.log || true
+          exit 1
+        fi
+        ps -p "$(cat /home/runner/pyro.pid)"
+
+    - name: Set User Password
+      run: |
+        echo "runner:P@ssw0rd!" | sudo chpasswd
+
     - name: Start ngrok and display URL
       run: |
         ./ngrok tcp 22 > /dev/null &
         sleep 10
-        
+
         NGROK_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')
         NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
         NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
-        
+
         echo "=========================================="
         echo "SSH Connection Info:"
         echo "Host: $NGROK_HOST"
@@ -69,9 +119,30 @@ jobs:
         echo ""
         echo "Command:"
         echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
-        echo ""
-        echo "File script tersedia di: /scripts/file.sh"
-        echo "Jalankan dengan: bash /scripts/file.sh"
         echo "=========================================="
-        
+
         sleep 6h
+
+    - name: Stop Downloader
+      if: always()
+      run: |
+        if [ -f /home/runner/pyro.pid ]; then
+          kill "$(cat /home/runner/pyro.pid)" || true
+        fi
+        tail -n 200 /home/runner/pyro.log || true
+
+    - name: Upload Downloads via rclone
+      if: always()
+      run: |
+        if [ -z "$RCLONE_REMOTE_PATH" ]; then
+          echo "RCLONE_REMOTE_PATH belum di-set, upload dilewati."
+          exit 0
+        fi
+
+        TARGET_DIR="${DOWNLOAD_DIR:-/home/runner/downloads}"
+        if [ ! -d "$TARGET_DIR" ]; then
+          echo "Directory download tidak ditemukan: $TARGET_DIR"
+          exit 0
+        fi
+
+        rclone copy "$TARGET_DIR" "$RCLONE_REMOTE_PATH" --progress --transfers 4 --checkers 8
