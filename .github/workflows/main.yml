@@ -1,19 +1,26 @@
-name: YXNZ
+name: YXN
 
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      filedrop_file:
+        description: "Path file di repo yang akan di-upload"
+        required: false
+        default: ""
+      filedrop_path:
+        description: "Path tujuan di FileDrop (opsional)"
+        required: false
+        default: ""
+      filedrop_action:
+        description: "Aksi jika file sudah ada: skip|keep|replace"
+        required: false
+        default: "skip"
 
 jobs:
   build:
+
     runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 370
-    env:
-      RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
-      RCLONE_REMOTE_PATH: ${{ secrets.RCLONE_REMOTE_PATH }}
-      MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
-      FILEDROP_SOURCE: ${{ secrets.FILEDROP_SOURCE }}
-      FILEDROP_NO_RECURSIVE: ${{ secrets.FILEDROP_NO_RECURSIVE }}
-      FILEDROP_DRY_RUN: ${{ secrets.FILEDROP_DRY_RUN }}
 
     steps:
     - name: Checkout repository
@@ -28,79 +35,44 @@ jobs:
     - name: Auth ngrok
       run: ./ngrok authtoken ${{ secrets.NGROK_AUTHTOKEN }}
     
-    - name: Setup SSH & Install Rclone
+    - name: Setup SSH
       run: |
         sudo apt-get update
-        sudo apt-get install -y openssh-server jq curl unzip
+        sudo apt-get install -y openssh-server jq
         sudo systemctl start ssh
         sudo systemctl enable ssh
-        
-        sudo -v ; curl https://rclone.org/install.sh | sudo bash
-        python -m pip install --upgrade pip
-        pip install requests
-    
-    - name: Setup Variable Environments
-      run: |
-        if [ -z "$FILEDROP_SOURCE" ]; then
-          echo "FILEDROP_SOURCE=/home/runner/uploads/*" >> "$GITHUB_ENV"
-        fi
-
-        if [ -z "$FILEDROP_DRY_RUN" ]; then
-          echo "FILEDROP_DRY_RUN=false" >> "$GITHUB_ENV"
-        fi
-
-        if [ -z "$RCLONE_CONF_DATA" ]; then
-          echo "RCLONE_CONF secret belum di-set."
-          exit 1
-        fi
-
-        mkdir -p /home/runner/.config/rclone /home/runner/uploads
-        printf '%s' "$RCLONE_CONF_DATA" > /home/runner/.config/rclone/rclone.conf
-        sudo chown -R runner:runner /home/runner/.config
-
-    - name: Sync Source via rclone (optional)
-      run: |
-        if [ -z "$RCLONE_REMOTE_PATH" ]; then
-          echo "RCLONE_REMOTE_PATH belum di-set, sync source dilewati."
-          exit 0
-        fi
-        rclone copy "$RCLONE_REMOTE_PATH" /home/runner/uploads --progress --transfers 4 --checkers 8
-
-    - name: Run FileDrop Uploader
-      run: |
-        if [ -z "$MEDIAFIRE_FILEDROP_KEY" ]; then
-          echo "MEDIAFIRE_FILEDROP_KEY secret belum di-set."
-          exit 1
-        fi
-
-        script_path=""
-        for candidate in "scripts/filedrop.py" "scripts/filedrop.py"; do
-          if [ -f "$candidate" ]; then
-            script_path="$candidate"
-            break
-          fi
-        done
-
-        if [ -z "$script_path" ]; then
-          echo "filedrop.py tidak ditemukan."
-          echo "Current directory: $(pwd)"
-          find . -maxdepth 4 -name "filedrop.py" -print || true
-          exit 1
-        fi
-
-        cmd=(python -u "$script_path" "$FILEDROP_SOURCE")
-        if [ "$FILEDROP_NO_RECURSIVE" = "true" ]; then
-          cmd+=("--no-recursive")
-        fi
-        if [ "$FILEDROP_DRY_RUN" = "true" ]; then
-          cmd+=("--dry-run")
-        fi
-        "${cmd[@]}"
     
     - name: Set User Password
       run: |
         echo "runner:P@ssw0rd!" | sudo chpasswd
-    
+
+    - name: Upload file via MediaFire FileDrop (optional)
+      if: ${{ github.event.inputs.filedrop_file }}
+      env:
+        FILEDROP_FILE: ${{ github.event.inputs.filedrop_file }}
+        FILEDROP_PATH: ${{ github.event.inputs.filedrop_path }}
+        FILEDROP_ACTION: ${{ github.event.inputs.filedrop_action }}
+        MEDIAFIRE_FILEDROP_KEY: ${{ secrets.MEDIAFIRE_FILEDROP_KEY }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${MEDIAFIRE_FILEDROP_KEY}" ]; then
+          echo "Secret MEDIAFIRE_FILEDROP_KEY belum diisi."
+          exit 1
+        fi
+
+        if [ ! -f "${FILEDROP_FILE}" ]; then
+          echo "File tidak ditemukan: ${FILEDROP_FILE}"
+          exit 1
+        fi
+
+        cmd=(bash scripts/filedrop.sh --file "${FILEDROP_FILE}" --action "${FILEDROP_ACTION}")
+        if [ -n "${FILEDROP_PATH}" ]; then
+          cmd+=(--path "${FILEDROP_PATH}")
+        fi
+
+        "${cmd[@]}"
+
     - name: Start ngrok and display URL
       run: |
         ./ngrok tcp 22 > /dev/null &
