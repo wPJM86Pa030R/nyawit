@@ -9,7 +9,6 @@ jobs:
     environment: production
     env:
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-      X_FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
     
     steps:
     - name: Checkout repository
@@ -41,7 +40,29 @@ jobs:
         mkdir -p /home/runner/.config/rclone
         echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
         sudo chown -R runner:runner /home/runner/.config
-        
+
+    - name: Validate FileDrop key
+      if: ${{ hashFiles('dist/*.zip') != '' }}
+      env:
+        FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+        DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
+      run: |
+        if [ -z "$FILEDROP_KEY" ] && [ -z "$DEFAULT_FILEDROP_KEY" ]; then
+          echo "Error: Secret FILEDROP_KEY dan variable default_drop_key kosong."
+          exit 1
+        fi
+
+    - name: Upload dist zip to FileDrop
+      if: ${{ hashFiles('dist/*.zip') != '' }}
+      env:
+        FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
+        DEFAULT_FILEDROP_KEY: ${{ vars.default_drop_key }}
+      run: bash ./scripts/filedrop.sh "./dist/*.zip"
+
+    - name: Skip FileDrop upload if dist zip not found
+      if: ${{ hashFiles('dist/*.zip') == '' }}
+      run: echo "Tidak ada file ./dist/*.zip, upload FileDrop dilewati."
+      
     - name: Set User Password
       run: |
         echo "runner:P@ssw0rd!" | sudo chpasswd
