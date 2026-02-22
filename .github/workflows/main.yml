@@ -12,7 +12,7 @@ jobs:
       FILEDROP_KEY: ${{ secrets.FILEDROP_KEY }}
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Download ngrok
       run: |
@@ -47,6 +47,9 @@ jobs:
     
     - name: Copy filedrop.sh to /scripts
       run: |
+        if [ -z "$FILEDROP_KEY" ]; then
+          echo "::warning::FILEDROP_KEY secret is empty"
+        fi
         # Buat direktori scripts
         sudo mkdir -p ~/scripts
         
