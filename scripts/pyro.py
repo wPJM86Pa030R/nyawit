@@ -3,6 +3,7 @@ import re
 import time
 import asyncio
 import shlex
+import shutil
 import datetime
 import json
 import glob
@@ -385,6 +386,92 @@ def trim_output(text: str) -> str:
     if len(text) <= LIST_MAX_CHARS:
         return text
     return text[: LIST_MAX_CHARS - 40] + "\n... output dipotong ..."
+
+
+def is_filesystem_root(path: Path) -> bool:
+    return path == path.parent
+
+
+def resolve_fs_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
+    raw = path_text.strip()
+    if not raw:
+        return [], "Path kosong."
+
+    if raw.startswith("file://"):
+        raw = raw[7:]
+
+    expanded = os.path.expandvars(raw)
+    is_absolute_or_home = expanded.startswith("~") or Path(expanded).is_absolute()
+    candidates = [expanded]
+    if not is_absolute_or_home:
+        candidates.append(str(upload_root / expanded))
+
+    matched_paths: List[Path] = []
+    seen_paths = set()
+    has_pattern = False
+
+    for candidate in candidates:
+        candidate_expanded = os.path.expanduser(candidate)
+        if has_wildcard(candidate_expanded):
+            has_pattern = True
+            raw_matches = sorted(glob.glob(candidate_expanded, recursive=True))
+            for item in raw_matches:
+                resolved = Path(item).resolve()
+                key = str(resolved)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    matched_paths.append(resolved)
+        else:
+            resolved = Path(candidate_expanded).resolve()
+            if resolved.exists():
+                key = str(resolved)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    matched_paths.append(resolved)
+
+    if matched_paths:
+        return matched_paths, None
+
+    if has_pattern:
+        return [], (
+            "Path tidak ditemukan untuk wildcard.\n"
+            f"Pola: `{path_text}`\n"
+            f"Default folder upload: `{upload_root}`"
+        )
+
+    if not is_absolute_or_home:
+        fallback_path = (upload_root / expanded).resolve()
+        return [], (
+            "Path tidak ditemukan.\n"
+            f"Input: `{path_text}`\n"
+            f"Cek juga: `{fallback_path}`"
+        )
+
+    return [], f"Path tidak ditemukan:\n`{Path(os.path.expanduser(expanded)).resolve()}`"
+
+
+def delete_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def copy_path(source: Path, destination: Path) -> Path:
+    if source.is_dir() and not source.is_symlink():
+        if destination.exists():
+            raise FileExistsError("Tujuan folder sudah ada.")
+        shutil.copytree(source, destination)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    return destination.resolve()
+
+
+def move_path(source: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    moved_to = Path(shutil.move(str(source), str(destination)))
+    return moved_to.resolve()
 
 
 def remove_file_quietly(path: Optional[Path]) -> None:
@@ -978,6 +1065,280 @@ async def list_command(client: Client, message):
     await message.edit_text(trim_output(output))
 
 
+@app.on_message(filters.me & filters.command("rm", prefixes="/"))
+async def remove_command(client: Client, message):
+    del client
+
+    if not message.from_user or message.chat.id != message.from_user.id:
+        await message.edit_text("Gunakan /rm hanya di Saved Messages.")
+        return
+
+    args = command_args(message)
+    path_text = " ".join(args).strip()
+    if not path_text and message.reply_to_message:
+        path_text = (
+            message.reply_to_message.text or message.reply_to_message.caption or ""
+        ).strip()
+
+    if not path_text:
+        await message.edit_text(
+            "Format hapus:\n"
+            "`/rm /home/runner/uploads/file.txt`\n"
+            "`/rm /home/runner/uploads/folder`\n"
+            "`/rm /home/runner/uploads/*.tmp`\n"
+            "Atau reply pesan berisi path lalu kirim `/rm`."
+        )
+        return
+
+    targets, resolve_error = resolve_fs_sources(path_text)
+    if resolve_error:
+        await message.edit_text(resolve_error)
+        return
+
+    success_lines = []
+    failed_lines = []
+
+    for target in targets:
+        if not target.exists():
+            failed_lines.append(f"- `{target}` -> path tidak ditemukan")
+            continue
+        if is_filesystem_root(target):
+            failed_lines.append(f"- `{target}` -> menolak hapus root filesystem")
+            continue
+
+        try:
+            delete_path(target)
+            success_lines.append(f"- `{target}`")
+        except Exception as e:
+            failed_lines.append(f"- `{target}` -> {e}")
+
+    summary_lines = [
+        "Hapus selesai.",
+        f"Input: `{path_text}`",
+        f"Target: `{len(targets)}`",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} item lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
+
+
+@app.on_message(filters.me & filters.command("copy", prefixes="/"))
+async def copy_command(client: Client, message):
+    del client
+
+    if not message.from_user or message.chat.id != message.from_user.id:
+        await message.edit_text("Gunakan /copy hanya di Saved Messages.")
+        return
+
+    args = command_args(message)
+    if len(args) < 2:
+        await message.edit_text(
+            "Format copy:\n"
+            "`/copy <sumber> <tujuan>`\n"
+            "Contoh:\n"
+            "`/copy /home/runner/uploads/file.txt /home/runner/downloads/file.txt`\n"
+            "`/copy /home/runner/uploads/*.mp4 /home/runner/downloads/`"
+        )
+        return
+
+    source_text = " ".join(args[:-1]).strip()
+    destination_text = args[-1].strip()
+    if not source_text or not destination_text:
+        await message.edit_text("Format copy tidak valid.")
+        return
+
+    source_paths, resolve_error = resolve_fs_sources(source_text)
+    if resolve_error:
+        await message.edit_text(resolve_error)
+        return
+
+    try:
+        destination_base = local_path_from_text(destination_text)
+    except Exception as e:
+        await message.edit_text(f"Tujuan tidak valid: `{e}`")
+        return
+
+    if len(source_paths) > 1 and (not destination_base.exists() or not destination_base.is_dir()):
+        await message.edit_text(
+            "Jika sumber lebih dari satu, tujuan harus folder yang sudah ada."
+        )
+        return
+
+    success_lines = []
+    failed_lines = []
+
+    for source_path in source_paths:
+        if not source_path.exists():
+            failed_lines.append(f"- `{source_path}` -> sumber tidak ditemukan")
+            continue
+        if is_filesystem_root(source_path):
+            failed_lines.append(
+                f"- `{source_path}` -> menolak operasi pada root filesystem"
+            )
+            continue
+
+        if len(source_paths) > 1 or (
+            destination_base.exists() and destination_base.is_dir()
+        ):
+            destination_path = destination_base / source_path.name
+        else:
+            destination_path = destination_base
+
+        if source_path.resolve() == destination_path.resolve():
+            failed_lines.append(f"- `{source_path}` -> sumber dan tujuan sama")
+            continue
+        if destination_path.exists():
+            failed_lines.append(f"- `{source_path}` -> tujuan sudah ada: `{destination_path}`")
+            continue
+
+        try:
+            copied_to = copy_path(source_path, destination_path)
+            success_lines.append(f"- `{source_path}` -> `{copied_to}`")
+        except Exception as e:
+            failed_lines.append(f"- `{source_path}` -> {e}")
+
+    summary_lines = [
+        "Copy selesai.",
+        f"Sumber: `{source_text}`",
+        f"Tujuan: `{destination_base}`",
+        f"Target: `{len(source_paths)}`",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} item lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
+
+
+@app.on_message(filters.me & filters.command("mv", prefixes="/"))
+async def move_command(client: Client, message):
+    del client
+
+    if not message.from_user or message.chat.id != message.from_user.id:
+        await message.edit_text("Gunakan /mv hanya di Saved Messages.")
+        return
+
+    args = command_args(message)
+    if len(args) < 2:
+        await message.edit_text(
+            "Format move:\n"
+            "`/mv <sumber> <tujuan>`\n"
+            "Contoh:\n"
+            "`/mv /home/runner/uploads/file.txt /home/runner/downloads/file.txt`\n"
+            "`/mv /home/runner/uploads/*.mp4 /home/runner/downloads/`"
+        )
+        return
+
+    source_text = " ".join(args[:-1]).strip()
+    destination_text = args[-1].strip()
+    if not source_text or not destination_text:
+        await message.edit_text("Format move tidak valid.")
+        return
+
+    source_paths, resolve_error = resolve_fs_sources(source_text)
+    if resolve_error:
+        await message.edit_text(resolve_error)
+        return
+
+    try:
+        destination_base = local_path_from_text(destination_text)
+    except Exception as e:
+        await message.edit_text(f"Tujuan tidak valid: `{e}`")
+        return
+
+    if len(source_paths) > 1 and (not destination_base.exists() or not destination_base.is_dir()):
+        await message.edit_text(
+            "Jika sumber lebih dari satu, tujuan harus folder yang sudah ada."
+        )
+        return
+
+    success_lines = []
+    failed_lines = []
+
+    for source_path in source_paths:
+        if not source_path.exists():
+            failed_lines.append(f"- `{source_path}` -> sumber tidak ditemukan")
+            continue
+        if is_filesystem_root(source_path):
+            failed_lines.append(
+                f"- `{source_path}` -> menolak operasi pada root filesystem"
+            )
+            continue
+
+        if len(source_paths) > 1 or (
+            destination_base.exists() and destination_base.is_dir()
+        ):
+            destination_path = destination_base / source_path.name
+        else:
+            destination_path = destination_base
+
+        if source_path.resolve() == destination_path.resolve():
+            failed_lines.append(f"- `{source_path}` -> sumber dan tujuan sama")
+            continue
+        if destination_path.exists():
+            failed_lines.append(f"- `{source_path}` -> tujuan sudah ada: `{destination_path}`")
+            continue
+
+        try:
+            moved_to = move_path(source_path, destination_path)
+            success_lines.append(f"- `{source_path}` -> `{moved_to}`")
+        except Exception as e:
+            failed_lines.append(f"- `{source_path}` -> {e}")
+
+    summary_lines = [
+        "Move selesai.",
+        f"Sumber: `{source_text}`",
+        f"Tujuan: `{destination_base}`",
+        f"Target: `{len(source_paths)}`",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} item lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
+
+
 if __name__ == "__main__":
     print("Userbot manual downloader aktif.")
     print("Langkah pakai:")
@@ -985,7 +1346,8 @@ if __name__ == "__main__":
     print("2. Reply pesan tersebut dengan /d1.")
     print("3. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("4. Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
-    print("5. Batalkan upload yang sedang berjalan: /ucancel")
-    print(f"6. File download disimpan ke: {download_root}")
-    print(f"7. Default folder upload: {upload_root}")
+    print("5. Hapus/copy/move file: /rm, /copy, /mv")
+    print("6. Batalkan upload yang sedang berjalan: /ucancel")
+    print(f"7. File download disimpan ke: {download_root}")
+    print(f"8. Default folder upload: {upload_root}")
     app.run()
