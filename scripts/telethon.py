@@ -861,10 +861,10 @@ async def download_command(event):
     )
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^/u1(?:\s|$)"))
+@client.on(events.NewMessage(outgoing=True, pattern=r"^/(?:u1|rclone)(?:\s|$)"))
 async def upload_command(event):
     if not is_saved_messages(event):
-        await safe_edit(event, "Gunakan /u1 hanya di Saved Messages.")
+        await safe_edit(event, "Gunakan /u1 atau /rclone hanya di Saved Messages.")
         return
 
     running_task = UPLOAD_CONTROL.get("task")
@@ -888,7 +888,7 @@ async def upload_command(event):
             await safe_edit(
                 event,
                 "Format target tidak valid.\n"
-                "Contoh: `/u1 /home/runner/uploads/file.mp4 --to @username`",
+                "Contoh: `/rclone /home/runner/uploads/file.mp4 --to @username`",
             )
             return
         target_chat = parse_chat_target(target_text)
@@ -903,10 +903,11 @@ async def upload_command(event):
         await safe_edit(
             event,
             "Format upload:\n"
-            "`/u1 /home/runner/uploads/file.mp4`\n"
-            "`/u1 *.txt`\n"
-            "`/u1 /home/runner/uploads/*.mp4 --to @username`\n"
-            "Atau reply pesan berisi path file lalu kirim `/u1`.",
+            "`/rclone /home/runner/uploads/file.mp4`\n"
+            "`/rclone *.txt`\n"
+            "`/rclone /home/runner/uploads/*.mp4 --to @username`\n"
+            "Alias lama: `/u1`\n"
+            "Atau reply pesan berisi path file lalu kirim `/rclone`.",
         )
         return
 
@@ -1430,7 +1431,7 @@ if __name__ == "__main__":
     print("Langkah pakai:")
     print("1. Forward file/video ATAU kirim link t.me ke Saved Messages.")
     print("2. Reply pesan tersebut dengan /d1.")
-    print("3. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
+    print("3. Upload file lokal: /rclone /path/file, /rclone *.txt, atau /rclone /path/*.mp4 --to @username (alias: /u1)")
     print("4. Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
     print("5. Hapus/copy/move file: /rm, /copy, /mv")
     print("6. Batalkan upload yang sedang berjalan: /ucancel")
