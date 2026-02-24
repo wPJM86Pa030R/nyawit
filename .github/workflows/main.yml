@@ -62,6 +62,8 @@ jobs:
 
     - name: Setup Variable Environments
       run: |
+        mkdir -p ~/downloads
+        mkdir -p ~/uploads
         mkdir -p ~/scripts
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
         wget -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
