@@ -3,10 +3,10 @@ import re
 import time
 import asyncio
 import shlex
+import shutil
 import datetime
 import json
 import glob
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -72,13 +72,6 @@ VIDEO_EXTENSIONS = {
 LIST_MAX_ENTRIES = int(os.getenv("LIST_MAX_ENTRIES", "200"))
 LIST_MAX_CHARS = int(os.getenv("LIST_MAX_CHARS", "3800"))
 UPLOAD_CONTROL = {"task": None, "cancel_event": None}
-RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
-RCLONE_REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*:(?!//).*$")
-WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/].*")
-try:
-    RCLONE_TIMEOUT = max(1, int(os.getenv("RCLONE_TIMEOUT", "600")))
-except ValueError:
-    RCLONE_TIMEOUT = 600
 
 
 def format_bytes(value: float) -> str:
@@ -277,6 +270,51 @@ def has_wildcard(path_text: str) -> bool:
     return any(char in path_text for char in ("*", "?", "["))
 
 
+def resolve_path_candidates(path_text: str) -> Tuple[List[Path], Optional[str]]:
+    raw = path_text.strip()
+    if not raw:
+        return [], "Path kosong."
+
+    if raw.startswith("file://"):
+        raw = raw[7:]
+
+    expanded = os.path.expandvars(raw)
+    candidate = os.path.expanduser(expanded)
+
+    if has_wildcard(candidate):
+        raw_matches = sorted(glob.glob(candidate, recursive=True))
+        if not raw_matches:
+            return [], f"Wildcard tidak cocok: `{path_text}`"
+
+        matched_paths: List[Path] = []
+        seen_paths = set()
+        for item in raw_matches:
+            resolved = Path(item).resolve()
+            key = str(resolved)
+            if key not in seen_paths:
+                seen_paths.add(key)
+                matched_paths.append(resolved)
+        return matched_paths, None
+
+    try:
+        resolved = Path(candidate).resolve()
+    except Exception as e:
+        return [], f"Path tidak valid `{path_text}`: {e}"
+
+    return [resolved], None
+
+
+def path_exists_or_symlink(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def is_root_path(path: Path) -> bool:
+    try:
+        return path.parent == path
+    except Exception:
+        return False
+
+
 def resolve_upload_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
     raw = path_text.strip()
     if not raw:
@@ -393,203 +431,6 @@ def trim_output(text: str) -> str:
     if len(text) <= LIST_MAX_CHARS:
         return text
     return text[: LIST_MAX_CHARS - 40] + "\n... output dipotong ..."
-
-
-def shell_join(parts: List[str]) -> str:
-    return " ".join(shlex.quote(part) for part in parts)
-
-
-def sanitize_output_block(text: str) -> str:
-    return text.replace("```", "'''")
-
-
-def is_rclone_remote_path(path_text: str) -> bool:
-    raw = (path_text or "").strip()
-    if not raw:
-        return False
-    if raw.startswith("file://"):
-        return False
-    if WINDOWS_DRIVE_RE.match(raw):
-        return False
-    return bool(RCLONE_REMOTE_RE.match(raw))
-
-
-def format_command_output(
-    command: List[str],
-    returncode: Optional[int],
-    stdout_text: str,
-    stderr_text: str,
-) -> str:
-    lines = [f"Command: `{shell_join(command)}`"]
-    lines.append(f"Exit code: `{returncode if returncode is not None else 'N/A'}`")
-
-    stdout_clean = sanitize_output_block(stdout_text.strip())
-    stderr_clean = sanitize_output_block(stderr_text.strip())
-
-    if stdout_clean:
-        lines.append("")
-        lines.append("stdout:")
-        lines.append("```text")
-        lines.append(stdout_clean)
-        lines.append("```")
-    if stderr_clean:
-        lines.append("")
-        lines.append("stderr:")
-        lines.append("```text")
-        lines.append(stderr_clean)
-        lines.append("```")
-    if not stdout_clean and not stderr_clean:
-        lines.append("")
-        lines.append("Tidak ada output.")
-
-    return trim_output("\n".join(lines))
-
-
-async def run_subprocess_command(
-    command: List[str], timeout_seconds: int
-) -> Tuple[Optional[int], str, str]:
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return None, "", f"Binary tidak ditemukan: {command[0]}"
-    except Exception as e:
-        return None, "", str(e)
-
-    try:
-        stdout_data, stderr_data = await asyncio.wait_for(
-            process.communicate(),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        process.kill()
-        stdout_data, stderr_data = await process.communicate()
-        stdout_text = stdout_data.decode("utf-8", errors="ignore")
-        stderr_text = stderr_data.decode("utf-8", errors="ignore").strip()
-        timeout_text = f"Perintah timeout setelah {timeout_seconds} detik."
-        if stderr_text:
-            stderr_text = f"{stderr_text}\n{timeout_text}"
-        else:
-            stderr_text = timeout_text
-        return process.returncode, stdout_text, stderr_text
-
-    stdout_text = stdout_data.decode("utf-8", errors="ignore")
-    stderr_text = stderr_data.decode("utf-8", errors="ignore")
-    return process.returncode, stdout_text, stderr_text
-
-
-async def run_rclone_command(args: List[str]) -> Tuple[List[str], Optional[int], str, str]:
-    command = [RCLONE_BIN, *args]
-    returncode, stdout_text, stderr_text = await run_subprocess_command(
-        command,
-        timeout_seconds=RCLONE_TIMEOUT,
-    )
-    return command, returncode, stdout_text, stderr_text
-
-
-def resolve_local_destination_path(source_path: Path, target_text: str) -> Path:
-    raw_target = target_text.strip()
-    target_path = local_path_from_text(raw_target)
-    target_is_dir_hint = raw_target.endswith("/") or raw_target.endswith("\\")
-
-    if target_path.exists() and target_path.is_dir():
-        return target_path / source_path.name
-    if target_is_dir_hint:
-        return target_path / source_path.name
-    return target_path
-
-
-def remove_local_path(path_text: str) -> Tuple[bool, str]:
-    try:
-        target_path = local_path_from_text(path_text)
-    except Exception as e:
-        return False, f"Path tidak valid: `{e}`"
-
-    if not target_path.exists():
-        return False, f"Path tidak ditemukan:\n`{target_path}`"
-
-    try:
-        if target_path.is_dir() and not target_path.is_symlink():
-            shutil.rmtree(target_path)
-            kind = "folder"
-        else:
-            target_path.unlink()
-            kind = "file"
-    except Exception as e:
-        return False, f"Gagal menghapus `{target_path}`:\n`{e}`"
-
-    return True, f"Berhasil menghapus {kind}:\n`{target_path}`"
-
-
-def copy_local_path(source_text: str, target_text: str) -> Tuple[bool, str]:
-    try:
-        source_path = local_path_from_text(source_text)
-    except Exception as e:
-        return False, f"Sumber tidak valid: `{e}`"
-
-    if not source_path.exists():
-        return False, f"Sumber tidak ditemukan:\n`{source_path}`"
-
-    try:
-        target_path = resolve_local_destination_path(source_path, target_text)
-    except Exception as e:
-        return False, f"Tujuan tidak valid: `{e}`"
-
-    if source_path == target_path:
-        return False, "Sumber dan tujuan tidak boleh sama."
-
-    try:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if source_path.is_dir() and not source_path.is_symlink():
-            shutil.copytree(source_path, target_path, dirs_exist_ok=True)
-            kind = "folder"
-        else:
-            shutil.copy2(source_path, target_path)
-            kind = "file"
-    except Exception as e:
-        return False, f"Gagal copy:\n`{e}`"
-
-    return (
-        True,
-        "Copy selesai.\n"
-        f"Tipe: `{kind}`\n"
-        f"Sumber: `{source_path}`\n"
-        f"Tujuan: `{target_path}`",
-    )
-
-
-def move_local_path(source_text: str, target_text: str) -> Tuple[bool, str]:
-    try:
-        source_path = local_path_from_text(source_text)
-    except Exception as e:
-        return False, f"Sumber tidak valid: `{e}`"
-
-    if not source_path.exists():
-        return False, f"Sumber tidak ditemukan:\n`{source_path}`"
-
-    try:
-        target_path = resolve_local_destination_path(source_path, target_text)
-    except Exception as e:
-        return False, f"Tujuan tidak valid: `{e}`"
-
-    if source_path == target_path:
-        return False, "Sumber dan tujuan tidak boleh sama."
-
-    try:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        moved_to = Path(shutil.move(str(source_path), str(target_path))).resolve()
-    except Exception as e:
-        return False, f"Gagal move:\n`{e}`"
-
-    return (
-        True,
-        "Move selesai.\n"
-        f"Sumber: `{source_path}`\n"
-        f"Tujuan: `{moved_to}`",
-    )
 
 
 def remove_file_quietly(path: Optional[Path]) -> None:
@@ -1183,8 +1024,80 @@ async def list_command(client: Client, message):
     await message.edit_text(trim_output(output))
 
 
+@app.on_message(filters.me & filters.command("mkdir", prefixes="/"))
+async def mkdir_command(client: Client, message):
+    del client
+
+    if not message.from_user or message.chat.id != message.from_user.id:
+        await message.edit_text("Gunakan /mkdir hanya di Saved Messages.")
+        return
+
+    args = command_args(message)
+    if not args:
+        await message.edit_text(
+            "Format:\n"
+            "`/mkdir /home/runner/new-folder`\n"
+            "`/mkdir \"./folder dengan spasi\"`"
+        )
+        return
+
+    created_lines = []
+    existed_lines = []
+    failed_lines = []
+
+    for raw_path in args:
+        try:
+            target_path = local_path_from_text(raw_path)
+        except Exception as e:
+            failed_lines.append(f"- `{raw_path}` -> path tidak valid: {e}")
+            continue
+
+        if target_path.exists():
+            if target_path.is_dir():
+                existed_lines.append(f"- `{target_path}`")
+            else:
+                failed_lines.append(f"- `{target_path}` -> sudah ada sebagai file")
+            continue
+
+        try:
+            target_path.mkdir(parents=True, exist_ok=False)
+            created_lines.append(f"- `{target_path}`")
+        except Exception as e:
+            failed_lines.append(f"- `{target_path}` -> {e}")
+
+    summary_lines = [
+        "mkdir selesai.",
+        f"Dibuat: `{len(created_lines)}`",
+        f"Sudah ada: `{len(existed_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if created_lines:
+        summary_lines.append("")
+        summary_lines.append("Folder dibuat:")
+        summary_lines.extend(created_lines[:20])
+        if len(created_lines) > 20:
+            summary_lines.append(f"... {len(created_lines) - 20} folder lain.")
+
+    if existed_lines:
+        summary_lines.append("")
+        summary_lines.append("Folder sudah ada:")
+        summary_lines.extend(existed_lines[:20])
+        if len(existed_lines) > 20:
+            summary_lines.append(f"... {len(existed_lines) - 20} folder lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
+
+
 @app.on_message(filters.me & filters.command("rm", prefixes="/"))
-async def remove_path_command(client: Client, message):
+async def remove_command(client: Client, message):
     del client
 
     if not message.from_user or message.chat.id != message.from_user.id:
@@ -1192,43 +1105,77 @@ async def remove_path_command(client: Client, message):
         return
 
     args = command_args(message)
-    if not args and message.reply_to_message:
-        reply_text = (
-            message.reply_to_message.text or message.reply_to_message.caption or ""
-        ).strip()
-        if reply_text:
-            args = [reply_text]
-
-    if len(args) != 1:
+    if not args:
         await message.edit_text(
-            "Format hapus:\n"
-            "`/rm <path>`\n"
-            "Contoh lokal: `/rm /home/runner/downloads/file.mp4`\n"
-            "Contoh remote: `/rm gdrive:folder/file.mp4`"
+            "Format:\n"
+            "`/rm /home/runner/uploads/file.txt`\n"
+            "`/rm /home/runner/uploads/tmp-folder`\n"
+            "`/rm *.tmp`"
         )
         return
 
-    target_text = args[0]
-    if is_rclone_remote_path(target_text):
-        await message.edit_text(f"Menjalankan rclone delete:\n`{target_text}`")
-        command, returncode, stdout_text, stderr_text = await run_rclone_command(
-            ["delete", target_text, "--rmdirs"]
-        )
-        status = "Hapus remote selesai." if returncode == 0 else "Hapus remote gagal."
-        output = (
-            f"{status}\n"
-            f"Target: `{target_text}`\n\n"
-            f"{format_command_output(command, returncode, stdout_text, stderr_text)}"
-        )
-        await message.edit_text(trim_output(output))
-        return
+    removed_file_lines = []
+    removed_dir_lines = []
+    failed_lines = []
 
-    _, output = remove_local_path(target_text)
-    await message.edit_text(output)
+    for raw_path in args:
+        targets, resolve_error = resolve_path_candidates(raw_path)
+        if resolve_error:
+            failed_lines.append(f"- `{raw_path}` -> {resolve_error}")
+            continue
+
+        for target_path in targets:
+            if is_root_path(target_path):
+                failed_lines.append(f"- `{target_path}` -> menolak hapus root path")
+                continue
+
+            if not path_exists_or_symlink(target_path):
+                failed_lines.append(f"- `{target_path}` -> tidak ditemukan")
+                continue
+
+            try:
+                if target_path.is_dir() and not target_path.is_symlink():
+                    shutil.rmtree(target_path)
+                    removed_dir_lines.append(f"- `{target_path}`")
+                else:
+                    target_path.unlink()
+                    removed_file_lines.append(f"- `{target_path}`")
+            except Exception as e:
+                failed_lines.append(f"- `{target_path}` -> {e}")
+
+    summary_lines = [
+        "rm selesai.",
+        f"File dihapus: `{len(removed_file_lines)}`",
+        f"Folder dihapus: `{len(removed_dir_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if removed_file_lines:
+        summary_lines.append("")
+        summary_lines.append("File dihapus:")
+        summary_lines.extend(removed_file_lines[:20])
+        if len(removed_file_lines) > 20:
+            summary_lines.append(f"... {len(removed_file_lines) - 20} file lain.")
+
+    if removed_dir_lines:
+        summary_lines.append("")
+        summary_lines.append("Folder dihapus:")
+        summary_lines.extend(removed_dir_lines[:20])
+        if len(removed_dir_lines) > 20:
+            summary_lines.append(f"... {len(removed_dir_lines) - 20} folder lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
 
 
 @app.on_message(filters.me & filters.command("copy", prefixes="/"))
-async def copy_path_command(client: Client, message):
+async def copy_command(client: Client, message):
     del client
 
     if not message.from_user or message.chat.id != message.from_user.id:
@@ -1238,39 +1185,90 @@ async def copy_path_command(client: Client, message):
     args = command_args(message)
     if len(args) != 2:
         await message.edit_text(
-            "Format copy:\n"
-            "`/copy <sumber> <tujuan>`\n"
-            "Contoh lokal: `/copy /home/runner/a.mp4 /home/runner/b.mp4`\n"
-            "Contoh remote: `/copy gdrive:a.mp4 gdrive:backup/a.mp4`"
+            "Format:\n"
+            "`/copy /home/runner/uploads/a.txt /home/runner/backup/a.txt`\n"
+            "`/copy *.mp4 /home/runner/backup/videos/`\n"
+            "Catatan: gunakan tanda kutip jika path mengandung spasi."
         )
         return
 
-    source_text, target_text = args
-    if is_rclone_remote_path(source_text) or is_rclone_remote_path(target_text):
+    source_text, destination_text = args
+    source_paths, source_error = resolve_path_candidates(source_text)
+    if source_error:
+        await message.edit_text(source_error)
+        return
+
+    existing_sources = [item for item in source_paths if path_exists_or_symlink(item)]
+    if not existing_sources:
+        await message.edit_text(f"Source tidak ditemukan:\n`{source_text}`")
+        return
+
+    try:
+        destination_path = local_path_from_text(destination_text)
+    except Exception as e:
+        await message.edit_text(f"Path tujuan tidak valid: `{e}`")
+        return
+
+    if len(existing_sources) > 1 and (not destination_path.exists() or not destination_path.is_dir()):
         await message.edit_text(
-            "Menjalankan rclone copyto...\n"
-            f"Sumber: `{source_text}`\n"
-            f"Tujuan: `{target_text}`"
+            "Jika source lebih dari satu, tujuan wajib folder yang sudah ada.\n"
+            f"Tujuan: `{destination_path}`"
         )
-        command, returncode, stdout_text, stderr_text = await run_rclone_command(
-            ["copyto", source_text, target_text]
-        )
-        status = "Copy remote selesai." if returncode == 0 else "Copy remote gagal."
-        output = (
-            f"{status}\n"
-            f"Sumber: `{source_text}`\n"
-            f"Tujuan: `{target_text}`\n\n"
-            f"{format_command_output(command, returncode, stdout_text, stderr_text)}"
-        )
-        await message.edit_text(trim_output(output))
         return
 
-    _, output = copy_local_path(source_text, target_text)
-    await message.edit_text(output)
+    success_lines = []
+    failed_lines = []
+
+    for source_path in existing_sources:
+        if destination_path.exists() and destination_path.is_dir():
+            target_path = destination_path / source_path.name
+        else:
+            target_path = destination_path
+
+        if path_exists_or_symlink(target_path):
+            failed_lines.append(f"- `{source_path}` -> target sudah ada: `{target_path}`")
+            continue
+
+        if not target_path.parent.exists():
+            failed_lines.append(
+                f"- `{source_path}` -> folder tujuan tidak ditemukan: `{target_path.parent}`"
+            )
+            continue
+
+        try:
+            if source_path.is_dir() and not source_path.is_symlink():
+                shutil.copytree(source_path, target_path)
+            else:
+                shutil.copy2(source_path, target_path)
+            success_lines.append(f"- `{source_path}` -> `{target_path}`")
+        except Exception as e:
+            failed_lines.append(f"- `{source_path}` -> {e}")
+
+    summary_lines = [
+        "copy selesai.",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} item lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
 
 
 @app.on_message(filters.me & filters.command("mv", prefixes="/"))
-async def move_path_command(client: Client, message):
+async def move_command(client: Client, message):
     del client
 
     if not message.from_user or message.chat.id != message.from_user.id:
@@ -1280,67 +1278,87 @@ async def move_path_command(client: Client, message):
     args = command_args(message)
     if len(args) != 2:
         await message.edit_text(
-            "Format move:\n"
-            "`/mv <sumber> <tujuan>`\n"
-            "Contoh lokal: `/mv /home/runner/a.mp4 /home/runner/archive/a.mp4`\n"
-            "Contoh remote: `/mv gdrive:a.mp4 gdrive:archive/a.mp4`"
+            "Format:\n"
+            "`/mv /home/runner/uploads/a.txt /home/runner/archive/a.txt`\n"
+            "`/mv *.log /home/runner/archive/`\n"
+            "Catatan: gunakan tanda kutip jika path mengandung spasi."
         )
         return
 
-    source_text, target_text = args
-    if is_rclone_remote_path(source_text) or is_rclone_remote_path(target_text):
+    source_text, destination_text = args
+    source_paths, source_error = resolve_path_candidates(source_text)
+    if source_error:
+        await message.edit_text(source_error)
+        return
+
+    existing_sources = [item for item in source_paths if path_exists_or_symlink(item)]
+    if not existing_sources:
+        await message.edit_text(f"Source tidak ditemukan:\n`{source_text}`")
+        return
+
+    try:
+        destination_path = local_path_from_text(destination_text)
+    except Exception as e:
+        await message.edit_text(f"Path tujuan tidak valid: `{e}`")
+        return
+
+    if len(existing_sources) > 1 and (not destination_path.exists() or not destination_path.is_dir()):
         await message.edit_text(
-            "Menjalankan rclone moveto...\n"
-            f"Sumber: `{source_text}`\n"
-            f"Tujuan: `{target_text}`"
-        )
-        command, returncode, stdout_text, stderr_text = await run_rclone_command(
-            ["moveto", source_text, target_text]
-        )
-        status = "Move remote selesai." if returncode == 0 else "Move remote gagal."
-        output = (
-            f"{status}\n"
-            f"Sumber: `{source_text}`\n"
-            f"Tujuan: `{target_text}`\n\n"
-            f"{format_command_output(command, returncode, stdout_text, stderr_text)}"
-        )
-        await message.edit_text(trim_output(output))
-        return
-
-    _, output = move_local_path(source_text, target_text)
-    await message.edit_text(output)
-
-
-@app.on_message(filters.me & filters.command("rclone", prefixes="/"))
-async def raw_rclone_command(client: Client, message):
-    del client
-
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /rclone hanya di Saved Messages.")
-        return
-
-    args = command_args(message)
-    if not args:
-        await message.edit_text(
-            "Format rclone:\n"
-            "`/rclone <argumen rclone>`\n"
-            "Contoh:\n"
-            "`/rclone ls gdrive:`\n"
-            "`/rclone lsf gdrive:folder`\n"
-            "`/rclone mkdir gdrive:folder-baru`"
+            "Jika source lebih dari satu, tujuan wajib folder yang sudah ada.\n"
+            f"Tujuan: `{destination_path}`"
         )
         return
 
-    command_preview = shell_join([RCLONE_BIN, *args])
-    await message.edit_text(f"Menjalankan perintah rclone:\n`{command_preview}`")
+    success_lines = []
+    failed_lines = []
 
-    command, returncode, stdout_text, stderr_text = await run_rclone_command(args)
-    status = "Perintah rclone selesai." if returncode == 0 else "Perintah rclone gagal."
-    output = (
-        f"{status}\n\n"
-        f"{format_command_output(command, returncode, stdout_text, stderr_text)}"
-    )
-    await message.edit_text(trim_output(output))
+    for source_path in existing_sources:
+        if destination_path.exists() and destination_path.is_dir():
+            target_path = destination_path / source_path.name
+        else:
+            target_path = destination_path
+
+        if source_path == target_path:
+            failed_lines.append(f"- `{source_path}` -> source dan target sama")
+            continue
+
+        if path_exists_or_symlink(target_path):
+            failed_lines.append(f"- `{source_path}` -> target sudah ada: `{target_path}`")
+            continue
+
+        if not target_path.parent.exists():
+            failed_lines.append(
+                f"- `{source_path}` -> folder tujuan tidak ditemukan: `{target_path.parent}`"
+            )
+            continue
+
+        try:
+            shutil.move(str(source_path), str(target_path))
+            success_lines.append(f"- `{source_path}` -> `{target_path}`")
+        except Exception as e:
+            failed_lines.append(f"- `{source_path}` -> {e}")
+
+    summary_lines = [
+        "mv selesai.",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} item lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await message.edit_text(trim_output("\n".join(summary_lines)))
 
 
 if __name__ == "__main__":
@@ -1350,9 +1368,8 @@ if __name__ == "__main__":
     print("2. Reply pesan tersebut dengan /d1.")
     print("3. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("4. Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
-    print("5. Operasi file: /rm <path>, /copy <sumber> <tujuan>, /mv <sumber> <tujuan>")
-    print("6. Rclone native: /rclone ls gdrive:")
-    print("7. Batalkan upload yang sedang berjalan: /ucancel")
-    print(f"8. File download disimpan ke: {download_root}")
-    print(f"9. Default folder upload: {upload_root}")
+    print("5. Batalkan upload yang sedang berjalan: /ucancel")
+    print("6. Manajemen file: /mkdir <path>, /rm <path>, /copy <source> <target>, /mv <source> <target>")
+    print(f"7. File download disimpan ke: {download_root}")
+    print(f"8. Default folder upload: {upload_root}")
     app.run()
