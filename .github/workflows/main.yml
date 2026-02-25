@@ -137,17 +137,9 @@ jobs:
         Password: $SSH_PASSWORD
 
         Command:
-        SSH_MESSAGE=$(cat <<EOF
-SSH Connection Info
-Host: $NGROK_HOST
-Port: $NGROK_PORT
-Username: runner
-Password: $SSH_PASSWORD
-
-Command:
-ssh runner@$NGROK_HOST -p $NGROK_PORT
-EOF
-)
+        ssh runner@$NGROK_HOST -p $NGROK_PORT
+        EOF
+        )
         curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
           --data-urlencode "text=${SSH_MESSAGE}" \
