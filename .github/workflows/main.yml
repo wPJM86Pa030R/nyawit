@@ -63,7 +63,7 @@ jobs:
         echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
         sudo chown -R runner:runner /home/runner/.config
 
-    - name: Setup Variable Environments
+    - name: Setup Filedrop
       run: |
         mkdir -p ~/downloads
         mkdir -p ~/uploads
