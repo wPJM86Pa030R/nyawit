@@ -103,13 +103,6 @@ jobs:
         fi
         ps -p "$(cat /home/runner/pyro.pid)"
 
-    - name: Set User Password
-      run: |
-        if [ -z "$SSH_PASSWORD" ]; then
-          echo "SSH_PASSWORD belum di-set."
-          exit 1
-        fi
-
     - name: Start ngrok and send SSH info to Telegram
       run: |
         ./ngrok tcp 22 > /dev/null &
