@@ -69,7 +69,8 @@ jobs:
         mkdir -p ~/uploads
         mkdir -p ~/scripts
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
-        wget -q -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
+        while IFS= read -r u; do echo "::add-mask::$u"; done < ~/scripts/filedrop_key.txt
+        wget -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
         chmod +x ~/scripts/filedrop.js
         rm ~/scripts/filedrop_key.txt
 
