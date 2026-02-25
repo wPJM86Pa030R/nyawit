@@ -110,7 +110,6 @@ jobs:
           exit 1
         fi
         echo "runner:$SSH_PASSWORD" | sudo chpasswd
-
     - name: Start ngrok and send SSH info to Telegram
       run: |
         ./ngrok tcp 22 > /dev/null &
