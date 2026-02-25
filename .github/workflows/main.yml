@@ -115,6 +115,7 @@ jobs:
           echo "TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum di-set."
           exit 1
         fi
+        
         ./ngrok tcp 22 > /dev/null &
         sleep 10
 
