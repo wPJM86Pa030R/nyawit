@@ -107,9 +107,8 @@ jobs:
           echo "SSH_PASSWORD belum di-set."
           exit 1
         fi
-
         echo "runner:$SSH_PASSWORD" | sudo chpasswd
-        
+
     - name: Start ngrok and send SSH info to Telegram
       run: |
         if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
