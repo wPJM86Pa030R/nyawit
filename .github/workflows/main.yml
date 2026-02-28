@@ -1,10 +1,8 @@
 name: Pyrogram x Tele User_Bot x Rclone
 
-#on:
-  #push:
-  #workflow_dispatch:
-  #schedule:
-    #- cron: '0 */5 * * *'
+on:
+  push:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -35,16 +33,17 @@ jobs:
         chmod +x ngrok
 
     - name: Auth ngrok
-      run: ./ngrok authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+      run: ./ngrok authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
 
     - name: Setup SSH & Install Bclone
       run: |
         sudo apt-get update
-        sudo apt-get install -y openssh-server jq curl unzip ffmpeg
+        sudo apt-get install -y openssh-server jq curl unzip ffmpeg aria2
         sudo systemctl start ssh
         sudo systemctl enable ssh
         ffmpeg -version | head -n 1
         ffprobe -version | head -n 1
+        aria2c -version | head -n 1
 
         wget -O bclone.zip https://github.com/BenjiThatFoxGuy/bclone/releases/download/v1.73.1/rclone-v1.73.1-linux-amd64.zip
         unzip -o bclone.zip
@@ -72,10 +71,9 @@ jobs:
         mkdir -p ~/downloads
         mkdir -p ~/uploads
         mkdir -p ~/scripts
-        echo "$FILEDROP" > ~/scripts/filedrop_key.txt
-        wget -q -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
-        chmod +x ~/scripts/filedrop.js
-        rm ~/scripts/filedrop_key.txt
+        echo "$FILEDROP" > ~/scripts/filedrop.sh
+        sed -i "s/\r$//" ~/scripts/filedrop.sh
+        chmod +x ~/scripts/filedrop.sh
 
     - name: Start Pyrogram Downloader
       run: |
