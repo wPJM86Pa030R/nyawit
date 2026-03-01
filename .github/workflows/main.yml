@@ -148,7 +148,7 @@ jobs:
         )
         ENCODED_CHAT_ID=$(printf '%s' "$TELEGRAM_CHAT_ID" | jq -sRr @uri)
         ENCODED_TEXT=$(printf '%s' "$SSH_MESSAGE" | jq -sRr @uri)
-        curl -fsS "https://api.telegram.org/bot${}/sendMessage?chat_id=${ENCODED_CHAT_ID}&text=${ENCODED_TEXT}&disable_web_page_preview=true" > /dev/null
+        curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${ENCODED_CHAT_ID}&text=${ENCODED_TEXT}&disable_web_page_preview=true" > /dev/null
 
         echo "Info SSH sudah dikirim ke Telegram."
 
