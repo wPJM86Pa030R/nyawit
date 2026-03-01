@@ -17,12 +17,30 @@ from pyrogram.errors import FloodWait, MessageIdInvalid
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_USER_ID_RAW = os.getenv("OWNER_USER_ID", "").strip()
+ARIA2_BIN = os.getenv("ARIA2_BIN", "aria2c")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/uploads")
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID dan API_HASH wajib diisi.")
+
+OWNER_USER_ID = None
+if OWNER_USER_ID_RAW:
+    try:
+        OWNER_USER_ID = int(OWNER_USER_ID_RAW)
+    except ValueError:
+        raise RuntimeError("OWNER_USER_ID harus angka jika diisi.")
+
+BOT_MODE = bool(BOT_TOKEN)
 
 api_id = int(API_ID)
 download_root = Path(DOWNLOAD_DIR).expanduser().resolve()
@@ -31,7 +49,14 @@ download_target = f"{download_root}{os.sep}"
 upload_root = Path(UPLOAD_DIR).expanduser().resolve()
 upload_root.mkdir(parents=True, exist_ok=True)
 
-if SESSION_STRING:
+if BOT_MODE:
+    app = Client(
+        "manual_downloader_bot",
+        api_id=api_id,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+    )
+elif SESSION_STRING:
     app = Client(
         "manual_downloader",
         api_id=api_id,
@@ -72,6 +97,24 @@ VIDEO_EXTENSIONS = {
 LIST_MAX_ENTRIES = int(os.getenv("LIST_MAX_ENTRIES", "200"))
 LIST_MAX_CHARS = int(os.getenv("LIST_MAX_CHARS", "3800"))
 UPLOAD_CONTROL = {"task": None, "cancel_event": None}
+DOWNLOAD_CONTROL = {
+    "task": None,
+    "lock": asyncio.Lock(),
+    "counter": 0,
+    "queue": [],
+    "current": None,
+    "history": [],
+}
+
+
+def command_filter(name: str, allow_public: bool = False):
+    if BOT_MODE:
+        return filters.command(name, prefixes="/")
+    if PUBLIC_MODE and allow_public:
+        scope_filter = filters.all
+    else:
+        scope_filter = filters.me
+    return filters.command(name, prefixes="/") & scope_filter
 
 
 def format_bytes(value: float) -> str:
@@ -93,6 +136,13 @@ def format_duration(seconds: int) -> str:
     if minutes:
         return f"{minutes:d}m {sec:02d}s"
     return f"{sec:d}s"
+
+
+def progress_bar(percent: float, width: int = 20) -> str:
+    safe_percent = max(0.0, min(100.0, percent))
+    filled = int(round((safe_percent / 100.0) * width))
+    filled = max(0, min(width, filled))
+    return "#" * filled + "-" * (width - filled)
 
 
 def parse_telegram_link(text: Optional[str]) -> Optional[Tuple[object, int]]:
@@ -166,13 +216,28 @@ async def progress_callback(current, total, status_message, media_name, state):
     speed = current / elapsed
     eta = int((total - current) / speed) if speed > 0 and total > 0 else 0
     percent = (current * 100 / total) if total > 0 else 0
+    bar = progress_bar(percent)
+
+    control = state.get("download_control")
+    request_id = state.get("download_request_id")
+    if control and request_id is not None:
+        current_state = control.get("current")
+        if current_state and current_state.get("id") == request_id:
+            current_state["current_bytes"] = int(current)
+            current_state["total_bytes"] = int(total) if total else 0
+            current_state["percent"] = float(percent)
+            current_state["speed"] = float(speed)
+            current_state["eta"] = int(eta)
+            current_state["elapsed"] = int(elapsed)
+            current_state["updated_at"] = now
 
     text = (
         "Download berjalan\n"
         f"File: {media_name}\n"
-        f"Progress: {percent:.2f}%\n"
+        f"Progress: [{bar}] {percent:.2f}%\n"
         f"Size: {format_bytes(current)} / {format_bytes(total)}\n"
         f"Speed: {format_bytes(speed)}/s\n"
+        f"Elapsed: {format_duration(int(elapsed))}\n"
         f"ETA: {format_duration(eta)}"
     )
 
@@ -256,6 +321,428 @@ def command_args(message):
     if len(parts) <= 1:
         return []
     return parts[1:]
+
+
+def parse_disk_command_target(command_name: str, args: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    path_parts = []
+    for arg in args:
+        if arg in {"-h", "--human-readable"}:
+            continue
+        if arg.startswith("-"):
+            return None, (
+                f"Opsi tidak dikenal: `{arg}`\n"
+                f"Format: `/{command_name} [-h] [path]`"
+            )
+        path_parts.append(arg)
+    return " ".join(path_parts).strip() or ".", None
+
+
+def parse_aria2_command_args(
+    args: List[str],
+) -> Tuple[Optional[List[str]], Optional[str], Optional[Path], Optional[str]]:
+    urls: List[str] = []
+    output_name: Optional[str] = None
+    target_dir: Path = download_root
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+
+        if arg in {"--out", "-o"}:
+            i += 1
+            if i >= len(args):
+                return None, None, None, "Nilai --out tidak boleh kosong."
+            output_name = args[i].strip()
+            if not output_name:
+                return None, None, None, "Nilai --out tidak boleh kosong."
+            if Path(output_name).name != output_name:
+                return None, None, None, "Nilai --out harus nama file, bukan path."
+        elif arg.startswith("--out="):
+            output_name = arg.split("=", 1)[1].strip()
+            if not output_name:
+                return None, None, None, "Nilai --out tidak boleh kosong."
+            if Path(output_name).name != output_name:
+                return None, None, None, "Nilai --out harus nama file, bukan path."
+        elif arg in {"--dir", "-d"}:
+            i += 1
+            if i >= len(args):
+                return None, None, None, "Nilai --dir tidak boleh kosong."
+            try:
+                target_dir = local_path_from_text(args[i])
+            except Exception as e:
+                return None, None, None, f"Path --dir tidak valid: `{e}`"
+        elif arg.startswith("--dir="):
+            dir_value = arg.split("=", 1)[1].strip()
+            if not dir_value:
+                return None, None, None, "Nilai --dir tidak boleh kosong."
+            try:
+                target_dir = local_path_from_text(dir_value)
+            except Exception as e:
+                return None, None, None, f"Path --dir tidak valid: `{e}`"
+        elif arg.startswith("-"):
+            return None, None, None, (
+                f"Opsi tidak dikenal: `{arg}`\n"
+                "Format: `/aria2 <url|magnet> [--out nama_file] [--dir path]`"
+            )
+        else:
+            urls.append(arg)
+
+        i += 1
+
+    if not urls:
+        return None, None, None, (
+            "Format aria2:\n"
+            "`/aria2 <url|magnet>`\n"
+            "`/aria2 <url> --out nama_file.ext`\n"
+            "`/aria2 <url|magnet> --dir /home/runner/downloads/`\n"
+            "Alias: `/a2`"
+        )
+
+    if output_name and len(urls) > 1:
+        return None, None, None, "--out hanya boleh dipakai jika URL sumber satu."
+
+    return urls, output_name, target_dir, None
+
+
+ARIA2_SIZE_RE = re.compile(
+    r"(?P<done>\d+(?:\.\d+)?[KMGTP]?i?B)/(?P<total>\d+(?:\.\d+)?[KMGTP]?i?B)\((?P<percent>\d{1,3})%\)",
+    re.IGNORECASE,
+)
+ARIA2_PERCENT_RE = re.compile(r"\((?P<percent>\d{1,3})%\)")
+ARIA2_SPEED_RE = re.compile(r"(?:DL|SPD):(?P<speed>[^\s\]]+)", re.IGNORECASE)
+ARIA2_ETA_RE = re.compile(r"ETA:(?P<eta>[^\s\]]+)", re.IGNORECASE)
+
+
+def update_aria2_progress_from_line(progress_state: Dict[str, object], line: str) -> None:
+    cleaned = line.strip()
+    if not cleaned:
+        return
+
+    changed = False
+
+    size_match = ARIA2_SIZE_RE.search(cleaned)
+    if size_match:
+        progress_state["size_done"] = size_match.group("done")
+        progress_state["size_total"] = size_match.group("total")
+        progress_state["percent"] = float(size_match.group("percent"))
+        changed = True
+    else:
+        percent_match = ARIA2_PERCENT_RE.search(cleaned)
+        if percent_match:
+            progress_state["percent"] = float(percent_match.group("percent"))
+            changed = True
+
+    speed_match = ARIA2_SPEED_RE.search(cleaned)
+    if speed_match:
+        speed = speed_match.group("speed")
+        if speed and not speed.endswith("/s"):
+            speed = f"{speed}/s"
+        progress_state["speed"] = speed
+        changed = True
+
+    eta_match = ARIA2_ETA_RE.search(cleaned)
+    if eta_match:
+        progress_state["eta"] = eta_match.group("eta")
+        changed = True
+
+    if changed:
+        progress_state["line"] = cleaned[:240]
+        progress_state["updated_at"] = time.time()
+
+
+async def collect_aria2_stream(
+    stream,
+    chunks: List[str],
+    progress_state: Dict[str, object],
+    tail_key: str,
+) -> None:
+    if not stream:
+        return
+
+    while True:
+        chunk = await stream.read(1024)
+        if not chunk:
+            break
+
+        text = chunk.decode("utf-8", errors="ignore")
+        chunks.append(text)
+        if len(chunks) > 200:
+            del chunks[:100]
+
+        pending = str(progress_state.get(tail_key, "")) + text
+        parts = re.split(r"[\r\n]", pending)
+        progress_state[tail_key] = parts.pop() if parts else ""
+        for part in parts:
+            update_aria2_progress_from_line(progress_state, part)
+
+    leftover = str(progress_state.get(tail_key, "")).strip()
+    if leftover:
+        update_aria2_progress_from_line(progress_state, leftover)
+    progress_state[tail_key] = ""
+
+
+def requester_label(message) -> str:
+    user = getattr(message, "from_user", None)
+    if not user:
+        return "unknown"
+    if user.username:
+        return f"@{user.username}"
+    full_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip()
+    if full_name:
+        return f"{full_name} ({user.id})"
+    return str(user.id)
+
+
+def is_saved_messages_only_violation(message) -> bool:
+    if not message.from_user:
+        return True
+    return message.chat.id != message.from_user.id
+
+
+def is_owner_in_bot_mode(message) -> bool:
+    if not BOT_MODE:
+        return False
+    if not OWNER_USER_ID or not message.from_user:
+        return False
+    return message.from_user.id == OWNER_USER_ID
+
+
+async def require_private_command_access(message, command_name: str) -> bool:
+    if BOT_MODE:
+        if not OWNER_USER_ID:
+            await open_status_message(
+                message,
+                "OWNER_USER_ID belum diatur. Set env OWNER_USER_ID agar command private aktif di mode bot.",
+            )
+            return False
+        if not is_owner_in_bot_mode(message):
+            await open_status_message(
+                message,
+                f"Perintah /{command_name} hanya untuk owner bot.",
+            )
+            return False
+        return True
+
+    if is_saved_messages_only_violation(message):
+        await open_status_message(message, f"Gunakan /{command_name} hanya di Saved Messages.")
+        return False
+    return True
+
+
+async def require_public_command_access(message, command_name: str) -> bool:
+    if BOT_MODE:
+        if PUBLIC_MODE:
+            return True
+        return await require_private_command_access(message, command_name)
+
+    if PUBLIC_MODE:
+        return True
+    if is_saved_messages_only_violation(message):
+        await open_status_message(message, f"Gunakan /{command_name} hanya di Saved Messages.")
+        return False
+    return True
+
+
+async def open_status_message(message, text: str):
+    if BOT_MODE:
+        return await message.reply_text(text)
+
+    if not PUBLIC_MODE or getattr(message, "outgoing", False):
+        try:
+            await message.edit_text(text)
+            return message
+        except Exception:
+            pass
+    return await message.reply_text(text)
+
+
+async def update_status_message(command_message, status_message, text: str):
+    try:
+        await status_message.edit_text(text)
+        return status_message
+    except Exception:
+        pass
+
+    try:
+        return await command_message.reply_text(text)
+    except Exception:
+        return status_message
+
+
+async def append_download_history(entry: Dict[str, object]) -> None:
+    async with DOWNLOAD_CONTROL["lock"]:
+        history = DOWNLOAD_CONTROL["history"]
+        history.insert(0, entry)
+        del history[20:]
+
+
+async def start_download_worker_if_needed(client: Client) -> None:
+    async with DOWNLOAD_CONTROL["lock"]:
+        current_task = DOWNLOAD_CONTROL.get("task")
+        if current_task and not current_task.done():
+            return
+        DOWNLOAD_CONTROL["task"] = asyncio.create_task(download_queue_worker(client))
+
+
+async def enqueue_download_request(
+    client: Client,
+    command_message,
+    status_message,
+    target_message,
+    media_name: str,
+) -> Tuple[int, int, int]:
+    now = time.time()
+    async with DOWNLOAD_CONTROL["lock"]:
+        DOWNLOAD_CONTROL["counter"] += 1
+        request_id = DOWNLOAD_CONTROL["counter"]
+        queue_item = {
+            "id": request_id,
+            "enqueued_at": now,
+            "command_message": command_message,
+            "status_message": status_message,
+            "target_message": target_message,
+            "media_name": media_name,
+            "requester": requester_label(command_message),
+            "chat_id": command_message.chat.id,
+        }
+        DOWNLOAD_CONTROL["queue"].append(queue_item)
+        queue_position = len(DOWNLOAD_CONTROL["queue"])
+        has_active = DOWNLOAD_CONTROL.get("current") is not None
+        overall_position = queue_position + (1 if has_active else 0)
+
+    await start_download_worker_if_needed(client)
+    return request_id, queue_position, overall_position
+
+
+async def snapshot_download_state() -> Dict[str, object]:
+    async with DOWNLOAD_CONTROL["lock"]:
+        current = DOWNLOAD_CONTROL.get("current")
+        queue = DOWNLOAD_CONTROL.get("queue", [])
+        history = DOWNLOAD_CONTROL.get("history", [])
+        return {
+            "current": dict(current) if current else None,
+            "queue": [dict(item) for item in queue],
+            "history": [dict(item) for item in history[:5]],
+        }
+
+
+async def download_queue_worker(client: Client):
+    while True:
+        async with DOWNLOAD_CONTROL["lock"]:
+            if not DOWNLOAD_CONTROL["queue"]:
+                DOWNLOAD_CONTROL["task"] = None
+                DOWNLOAD_CONTROL["current"] = None
+                return
+
+            item = DOWNLOAD_CONTROL["queue"].pop(0)
+            started_at = time.time()
+            DOWNLOAD_CONTROL["current"] = {
+                "id": item["id"],
+                "media_name": item["media_name"],
+                "requester": item["requester"],
+                "chat_id": item["chat_id"],
+                "started_at": started_at,
+                "current_bytes": 0,
+                "total_bytes": 0,
+                "percent": 0.0,
+                "speed": 0.0,
+                "eta": 0,
+                "elapsed": 0,
+                "updated_at": started_at,
+            }
+            remaining_queue = len(DOWNLOAD_CONTROL["queue"])
+
+        command_message = item["command_message"]
+        status_message = item["status_message"]
+        media_name = item["media_name"]
+        request_id = item["id"]
+        state = {
+            "started_at": time.time(),
+            "last_tick": 0.0,
+            "download_control": DOWNLOAD_CONTROL,
+            "download_request_id": request_id,
+        }
+
+        status_message = await update_status_message(
+            command_message,
+            status_message,
+            "Memulai download dari antrian\n"
+            f"ID: `#{request_id}`\n"
+            f"File: {media_name}\n"
+            f"Sisa antrian setelah ini: `{remaining_queue}`",
+        )
+
+        download_started_at = time.time()
+        try:
+            file_path = await item["target_message"].download(
+                file_name=download_target,
+                progress=progress_callback,
+                progress_args=(status_message, media_name, state),
+            )
+        except Exception as e:
+            await update_status_message(
+                command_message,
+                status_message,
+                "Download gagal.\n"
+                f"ID: `#{request_id}`\n"
+                f"File: {media_name}\n"
+                f"Error: `{e}`",
+            )
+            await append_download_history(
+                {
+                    "id": request_id,
+                    "media_name": media_name,
+                    "requester": item["requester"],
+                    "status": "failed",
+                    "duration": int(max(0, time.time() - download_started_at)),
+                    "error": str(e),
+                    "finished_at": int(time.time()),
+                }
+            )
+        else:
+            if not file_path:
+                await update_status_message(
+                    command_message,
+                    status_message,
+                    "Download gagal: path file kosong.\n"
+                    f"ID: `#{request_id}`\n"
+                    f"File: {media_name}",
+                )
+                await append_download_history(
+                    {
+                        "id": request_id,
+                        "media_name": media_name,
+                        "requester": item["requester"],
+                        "status": "failed",
+                        "duration": int(max(0, time.time() - download_started_at)),
+                        "error": "path file kosong",
+                        "finished_at": int(time.time()),
+                    }
+                )
+            else:
+                await update_status_message(
+                    command_message,
+                    status_message,
+                    "Download selesai.\n"
+                    f"ID: `#{request_id}`\n"
+                    f"Lokasi: `{file_path}`",
+                )
+                await append_download_history(
+                    {
+                        "id": request_id,
+                        "media_name": media_name,
+                        "requester": item["requester"],
+                        "status": "done",
+                        "duration": int(max(0, time.time() - download_started_at)),
+                        "path": str(file_path),
+                        "finished_at": int(time.time()),
+                    }
+                )
+        finally:
+            async with DOWNLOAD_CONTROL["lock"]:
+                current = DOWNLOAD_CONTROL.get("current")
+                if current and current.get("id") == request_id:
+                    DOWNLOAD_CONTROL["current"] = None
 
 
 def local_path_from_text(path_text: str) -> Path:
@@ -431,6 +918,40 @@ def trim_output(text: str) -> str:
     if len(text) <= LIST_MAX_CHARS:
         return text
     return text[: LIST_MAX_CHARS - 40] + "\n... output dipotong ..."
+
+
+def compute_path_usage(target_path: Path) -> Tuple[int, int, int, int]:
+    total_bytes = 0
+    file_count = 0
+    dir_count = 0
+    error_count = 0
+
+    stack = [target_path]
+    while stack:
+        current = stack.pop()
+        try:
+            if current.is_symlink():
+                total_bytes += current.lstat().st_size
+                file_count += 1
+                continue
+
+            if current.is_file():
+                total_bytes += current.stat().st_size
+                file_count += 1
+                continue
+
+            if current.is_dir():
+                dir_count += 1
+                try:
+                    for item in current.iterdir():
+                        stack.append(item)
+                except Exception:
+                    error_count += 1
+                continue
+        except Exception:
+            error_count += 1
+
+    return total_bytes, file_count, dir_count, error_count
 
 
 def remove_file_quietly(path: Optional[Path]) -> None:
@@ -698,64 +1219,316 @@ async def resolve_target_message(client: Client, replied_message):
 
 
 # Manual only, no auto-download.
-@app.on_message(filters.me & filters.command("d1", prefixes="/"))
+@app.on_message(command_filter("d1", allow_public=True))
 async def download_command(client: Client, message):
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /d1 hanya di Saved Messages.")
+    if not await require_public_command_access(message, "d1"):
         return
 
     if not message.reply_to_message:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Balas pesan yang berisi file/video atau link Telegram, lalu kirim /d1."
         )
         return
 
-    await message.edit_text("Memeriksa pesan yang dibalas...")
+    status_message = await open_status_message(message, "Memeriksa pesan yang dibalas...")
     target_message, error_message = await resolve_target_message(
         client, message.reply_to_message
     )
     if error_message:
-        await message.edit_text(error_message)
+        await update_status_message(message, status_message, error_message)
         return
 
     name = media_label(target_message)
-    state = {"started_at": time.time(), "last_tick": 0.0}
-
-    await message.edit_text(
-        "Memulai download ke storage VPS\n"
-        f"Folder: `{download_root}`\n"
-        f"File: {name}"
+    request_id, queue_position, overall_position = await enqueue_download_request(
+        client=client,
+        command_message=message,
+        status_message=status_message,
+        target_message=target_message,
+        media_name=name,
     )
+
+    await update_status_message(
+        message,
+        status_message,
+        "Permintaan download masuk antrian.\n"
+        f"ID: `#{request_id}`\n"
+        f"File: {name}\n"
+        f"Posisi antrian: `{queue_position}`\n"
+        f"Posisi total (termasuk yang aktif): `{overall_position}`\n"
+        "Gunakan `/dstatus` untuk lihat detail."
+    )
+
+
+@app.on_message(command_filter(["dstatus", "dqueue"], allow_public=True))
+async def download_status_command(client: Client, message):
+    del client
+
+    if not await require_public_command_access(message, "dstatus"):
+        return
+
+    snapshot = await snapshot_download_state()
+    current = snapshot["current"]
+    queue = snapshot["queue"]
+    history = snapshot["history"]
+    now = time.time()
+
+    lines = ["Status download:"]
+
+    if current:
+        percent = float(current.get("percent", 0.0))
+        bar = progress_bar(percent)
+        current_bytes = int(current.get("current_bytes", 0))
+        total_bytes = int(current.get("total_bytes", 0))
+        speed = float(current.get("speed", 0.0))
+        eta = int(current.get("eta", 0))
+        started_at = float(current.get("started_at", now))
+        elapsed = max(0, int(now - started_at))
+
+        lines.extend(
+            [
+                "",
+                f"Aktif: `#{current.get('id')}`",
+                f"File: `{current.get('media_name', 'unknown')}`",
+                f"Requester: `{current.get('requester', 'unknown')}`",
+                f"Progress: [{bar}] {percent:.2f}%",
+                (
+                    f"Size: `{format_bytes(float(current_bytes))}` / "
+                    f"`{format_bytes(float(total_bytes))}`"
+                    if total_bytes > 0
+                    else f"Size: `{format_bytes(float(current_bytes))}` / `unknown`"
+                ),
+                f"Speed: `{format_bytes(speed)}/s`",
+                f"Elapsed: `{format_duration(elapsed)}`",
+                f"ETA: `{format_duration(eta)}`",
+            ]
+        )
+    else:
+        lines.extend(["", "Aktif: tidak ada download berjalan."])
+
+    lines.extend(["", f"Antrian pending: `{len(queue)}`"])
+    if queue:
+        lines.append("Daftar antrian:")
+        for index, item in enumerate(queue[:10], start=1):
+            wait_seconds = max(0, int(now - float(item.get("enqueued_at", now))))
+            lines.append(
+                f"{index}. `#{item.get('id')}` `{item.get('media_name', 'unknown')}` | "
+                f"by `{item.get('requester', 'unknown')}` | "
+                f"tunggu `{format_duration(wait_seconds)}`"
+            )
+        if len(queue) > 10:
+            lines.append(f"... {len(queue) - 10} item lain.")
+
+    if history:
+        lines.extend(["", "Riwayat terakhir:"])
+        for item in history[:5]:
+            status = "selesai" if item.get("status") == "done" else "gagal"
+            duration = format_duration(int(item.get("duration", 0)))
+            base = f"- `#{item.get('id')}` `{item.get('media_name', 'unknown')}` -> {status} ({duration})"
+            if item.get("error"):
+                base += f" | `{item.get('error')}`"
+            lines.append(base)
+
+    await open_status_message(message, trim_output("\n".join(lines)))
+
+
+@app.on_message(command_filter(["aria2", "a2"], allow_public=True))
+async def aria2_download_command(client: Client, message):
+    del client
+
+    if not await require_public_command_access(message, "aria2"):
+        return
+
+    args = command_args(message)
+    urls, output_name, target_dir, parse_error = parse_aria2_command_args(args)
+    if parse_error:
+        await open_status_message(message, parse_error)
+        return
+
+    if not target_dir:
+        await open_status_message(message, "Folder target tidak valid.")
+        return
 
     try:
-        file_path = await target_message.download(
-            file_name=download_target,
-            progress=progress_callback,
-            progress_args=(message, name, state),
-        )
+        target_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        await message.edit_text(f"Download gagal: `{e}`")
+        await open_status_message(message, f"Gagal membuat folder target: `{e}`")
         return
 
-    if not file_path:
-        await message.edit_text("Download gagal: path file kosong.")
-        return
+    command = [
+        ARIA2_BIN,
+        "--dir",
+        str(target_dir),
+        "--continue=true",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=true",
+        "--summary-interval=1",
+        "--download-result=full",
+        "--show-console-readout=true",
+        "--console-log-level=warn",
+        "--file-allocation=none",
+    ]
+    if output_name:
+        command.extend(["--out", output_name])
+    command.extend(urls or [])
 
-    await message.edit_text(
-        "Download selesai.\n"
-        f"Lokasi: `{file_path}`"
+    status_message = await open_status_message(
+        message,
+        "Memulai download via aria2...\n"
+        f"Target folder: `{target_dir}`\n"
+        f"Sumber: `{len(urls or [])}` item",
     )
 
+    started_at = time.time()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        await update_status_message(
+            message,
+            status_message,
+            "aria2c tidak ditemukan.\n"
+            f"Set env `ARIA2_BIN` (saat ini: `{ARIA2_BIN}`) ke binary aria2 yang valid.",
+        )
+        return
+    except Exception as e:
+        await update_status_message(message, status_message, f"Gagal menjalankan aria2: `{e}`")
+        return
 
-@app.on_message(filters.me & filters.command("u1", prefixes="/"))
+    progress_state: Dict[str, object] = {
+        "percent": None,
+        "size_done": None,
+        "size_total": None,
+        "speed": None,
+        "eta": None,
+        "line": None,
+        "updated_at": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+    }
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    stdout_task = asyncio.create_task(
+        collect_aria2_stream(process.stdout, stdout_chunks, progress_state, "stdout_tail")
+    )
+    stderr_task = asyncio.create_task(
+        collect_aria2_stream(process.stderr, stderr_chunks, progress_state, "stderr_tail")
+    )
+
+    last_tick = 0.0
+    while True:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+            break
+        except asyncio.TimeoutError:
+            now = time.time()
+            if (now - last_tick) >= PROGRESS_INTERVAL:
+                elapsed = format_duration(int(now - started_at))
+                percent = progress_state.get("percent")
+                if percent is not None:
+                    percent_float = float(percent)
+                    bar = progress_bar(percent_float)
+                    size_done = progress_state.get("size_done") or "unknown"
+                    size_total = progress_state.get("size_total") or "unknown"
+                    speed = progress_state.get("speed") or "unknown"
+                    eta = progress_state.get("eta") or "unknown"
+                    updated_at = progress_state.get("updated_at")
+                    update_age = (
+                        format_duration(int(max(0, now - float(updated_at))))
+                        if updated_at
+                        else "unknown"
+                    )
+                    progress_lines = [
+                        "Aria2 sedang berjalan...",
+                        f"PID: `{process.pid}`",
+                        f"Target folder: `{target_dir}`",
+                        f"Progress: [{bar}] `{percent_float:.2f}%`",
+                        f"Size: `{size_done}` / `{size_total}`",
+                        f"Speed: `{speed}`",
+                        f"ETA: `{eta}`",
+                        f"Elapsed: `{elapsed}`",
+                        f"Update terakhir: `{update_age}` lalu",
+                    ]
+                    raw_line = progress_state.get("line")
+                    if raw_line:
+                        progress_lines.append("")
+                        progress_lines.append("Raw:")
+                        progress_lines.append(f"`{raw_line}`")
+                    status_message = await update_status_message(
+                        message,
+                        status_message,
+                        "\n".join(progress_lines),
+                    )
+                else:
+                    status_message = await update_status_message(
+                        message,
+                        status_message,
+                        "Aria2 sedang berjalan...\n"
+                        f"PID: `{process.pid}`\n"
+                        f"Target folder: `{target_dir}`\n"
+                        f"Elapsed: `{elapsed}`\n"
+                        "Menunggu data progress dari aria2...",
+                    )
+                last_tick = now
+
+    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    stdout_text = "".join(stdout_chunks).strip()
+    stderr_text = "".join(stderr_chunks).strip()
+    elapsed_text = format_duration(int(max(0, time.time() - started_at)))
+    stdout_tail = "\n".join(stdout_text.splitlines()[-12:]) if stdout_text else ""
+    stderr_tail = "\n".join(stderr_text.splitlines()[-12:]) if stderr_text else ""
+
+    if process.returncode == 0:
+        summary_lines = [
+            "Aria2 selesai.",
+            f"Target folder: `{target_dir}`",
+            f"Durasi: `{elapsed_text}`",
+            f"Return code: `{process.returncode}`",
+        ]
+        if output_name:
+            summary_lines.append(f"Output name: `{output_name}`")
+        if stdout_tail:
+            summary_lines.append("")
+            summary_lines.append("Ringkasan aria2 (stdout):")
+            summary_lines.append("```text")
+            summary_lines.append(stdout_tail)
+            summary_lines.append("```")
+        await update_status_message(message, status_message, trim_output("\n".join(summary_lines)))
+        return
+
+    failed_lines = [
+        "Aria2 gagal.",
+        f"Target folder: `{target_dir}`",
+        f"Durasi: `{elapsed_text}`",
+        f"Return code: `{process.returncode}`",
+    ]
+    if stderr_tail:
+        failed_lines.append("")
+        failed_lines.append("Error aria2 (stderr):")
+        failed_lines.append("```text")
+        failed_lines.append(stderr_tail)
+        failed_lines.append("```")
+    elif stdout_tail:
+        failed_lines.append("")
+        failed_lines.append("Output aria2 (stdout):")
+        failed_lines.append("```text")
+        failed_lines.append(stdout_tail)
+        failed_lines.append("```")
+    await update_status_message(message, status_message, trim_output("\n".join(failed_lines)))
+
+
+@app.on_message(command_filter("u1"))
 async def upload_command(client: Client, message):
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /u1 hanya di Saved Messages.")
+    if not await require_private_command_access(message, "u1"):
         return
 
     running_task = UPLOAD_CONTROL.get("task")
     if running_task and not running_task.done():
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Masih ada upload aktif.\n"
             "Gunakan `/ucancel` untuk membatalkan upload yang sedang berjalan."
         )
@@ -770,7 +1543,8 @@ async def upload_command(client: Client, message):
         source_path_text = " ".join(args[:idx]).strip()
         target_text = " ".join(args[idx + 1 :]).strip()
         if not target_text:
-            await message.edit_text(
+            await open_status_message(
+                message,
                 "Format target tidak valid.\n"
                 "Contoh: `/u1 /home/runner/uploads/file.mp4 --to @username`"
             )
@@ -785,7 +1559,8 @@ async def upload_command(client: Client, message):
         ).strip()
 
     if not source_path_text:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Format upload:\n"
             "`/u1 /home/runner/uploads/file.mp4`\n"
             "`/u1 *.txt`\n"
@@ -796,17 +1571,21 @@ async def upload_command(client: Client, message):
 
     source_paths, resolve_error = resolve_upload_sources(source_path_text)
     if resolve_error:
-        await message.edit_text(resolve_error)
+        await open_status_message(message, resolve_error)
         return
 
     cancel_event = asyncio.Event()
     UPLOAD_CONTROL["task"] = asyncio.current_task()
     UPLOAD_CONTROL["cancel_event"] = cancel_event
 
+    if target_chat == "me":
+        target_chat = message.chat.id
+
     target = target_label(target_chat)
     total_files = len(source_paths)
 
-    await message.edit_text(
+    status_message = await open_status_message(
+        message,
         "Memulai upload dari storage VPS\n"
         f"Input: `{source_path_text}`\n"
         f"Ditemukan: `{total_files}` file\n"
@@ -826,7 +1605,9 @@ async def upload_command(client: Client, message):
         media_name = source_path.name
         state = {"started_at": time.time(), "last_tick": 0.0, "cancel_event": cancel_event}
 
-        await message.edit_text(
+        status_message = await update_status_message(
+            message,
+            status_message,
             "Upload berjalan\n"
             f"File: `{index}/{total_files}`\n"
             f"Nama: `{media_name}`\n"
@@ -843,7 +1624,7 @@ async def upload_command(client: Client, message):
                     "caption": f"`{media_name}`",
                     "supports_streaming": True,
                     "progress": upload_progress_callback,
-                    "progress_args": (message, media_name, state),
+                    "progress_args": (status_message, media_name, state),
                 }
                 video_metadata = await probe_video_metadata(source_path)
                 for key in ("duration", "width", "height"):
@@ -877,7 +1658,7 @@ async def upload_command(client: Client, message):
                     document=str(source_path),
                     caption=f"`{media_name}`",
                     progress=upload_progress_callback,
-                    progress_args=(message, media_name, state),
+                    progress_args=(status_message, media_name, state),
                 )
         except asyncio.CancelledError:
             cancel_event.set()
@@ -921,7 +1702,7 @@ async def upload_command(client: Client, message):
             summary_lines.append(f"... {len(failed_lines) - 20} file lain.")
 
     try:
-        await message.edit_text(trim_output("\n".join(summary_lines)))
+        await update_status_message(message, status_message, trim_output("\n".join(summary_lines)))
     finally:
         current_task = asyncio.current_task()
         if UPLOAD_CONTROL.get("task") is current_task:
@@ -929,12 +1710,11 @@ async def upload_command(client: Client, message):
             UPLOAD_CONTROL["cancel_event"] = None
 
 
-@app.on_message(filters.me & filters.command("ucancel", prefixes="/"))
+@app.on_message(command_filter("ucancel"))
 async def cancel_upload_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /ucancel hanya di Saved Messages.")
+    if not await require_private_command_access(message, "ucancel"):
         return
 
     running_task = UPLOAD_CONTROL.get("task")
@@ -943,22 +1723,22 @@ async def cancel_upload_command(client: Client, message):
     if not running_task or running_task.done() or not cancel_event:
         UPLOAD_CONTROL["task"] = None
         UPLOAD_CONTROL["cancel_event"] = None
-        await message.edit_text("Tidak ada upload yang sedang berjalan.")
+        await open_status_message(message, "Tidak ada upload yang sedang berjalan.")
         return
 
     cancel_event.set()
-    await message.edit_text(
+    await open_status_message(
+        message,
         "Permintaan cancel diterima.\n"
         "Menunggu proses upload berhenti..."
     )
 
 
-@app.on_message(filters.me & filters.command("ls", prefixes="/"))
+@app.on_message(command_filter("ls"))
 async def list_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /ls hanya di Saved Messages.")
+    if not await require_private_command_access(message, "ls"):
         return
 
     args = command_args(message)
@@ -974,11 +1754,11 @@ async def list_command(client: Client, message):
     try:
         target_path = local_path_from_text(path_text)
     except Exception as e:
-        await message.edit_text(f"Path tidak valid: `{e}`")
+        await open_status_message(message, f"Path tidak valid: `{e}`")
         return
 
     if not target_path.exists():
-        await message.edit_text(f"Path tidak ditemukan:\n`{target_path}`")
+        await open_status_message(message, f"Path tidak ditemukan:\n`{target_path}`")
         return
 
     if target_path.is_file():
@@ -989,16 +1769,16 @@ async def list_command(client: Client, message):
             f"{format_entry_line(target_path)}\n"
             "```"
         )
-        await message.edit_text(trim_output(output))
+        await open_status_message(message, trim_output(output))
         return
 
     try:
         lines, total_entries, truncated = list_directory_lines(target_path, show_all)
     except PermissionError:
-        await message.edit_text(f"Akses ditolak:\n`{target_path}`")
+        await open_status_message(message, f"Akses ditolak:\n`{target_path}`")
         return
     except Exception as e:
-        await message.edit_text(f"Gagal membaca direktori: `{e}`")
+        await open_status_message(message, f"Gagal membaca direktori: `{e}`")
         return
 
     if not lines:
@@ -1007,7 +1787,7 @@ async def list_command(client: Client, message):
             f"Total: `{total_entries}`\n\n"
             "(kosong)"
         )
-        await message.edit_text(output)
+        await open_status_message(message, output)
         return
 
     note = ""
@@ -1021,20 +1801,102 @@ async def list_command(client: Client, message):
         + "\n".join(lines)
         + "\n```"
     )
-    await message.edit_text(trim_output(output))
+    await open_status_message(message, trim_output(output))
 
 
-@app.on_message(filters.me & filters.command("mkdir", prefixes="/"))
+@app.on_message(command_filter("du", allow_public=True))
+async def disk_usage_command(client: Client, message):
+    del client
+
+    if not await require_public_command_access(message, "du"):
+        return
+
+    args = command_args(message)
+    path_text, parse_error = parse_disk_command_target("du", args)
+    if parse_error:
+        await open_status_message(message, parse_error)
+        return
+
+    try:
+        target_path = local_path_from_text(path_text)
+    except Exception as e:
+        await open_status_message(message, f"Path tidak valid: `{e}`")
+        return
+
+    if not path_exists_or_symlink(target_path):
+        await open_status_message(message, f"Path tidak ditemukan:\n`{target_path}`")
+        return
+
+    total_bytes, file_count, dir_count, error_count = compute_path_usage(target_path)
+
+    summary_lines = [
+        "du selesai.",
+        f"Path: `{target_path}`",
+        f"Total ukuran: `{format_bytes(float(total_bytes))}`",
+        f"Jumlah file: `{file_count}`",
+        f"Jumlah folder: `{dir_count}`",
+    ]
+    if error_count:
+        summary_lines.append(f"Catatan: `{error_count}` item gagal diakses.")
+
+    await open_status_message(message, "\n".join(summary_lines))
+
+
+@app.on_message(command_filter("df", allow_public=True))
+async def disk_free_command(client: Client, message):
+    del client
+
+    if not await require_public_command_access(message, "df"):
+        return
+
+    args = command_args(message)
+    path_text, parse_error = parse_disk_command_target("df", args)
+    if parse_error:
+        await open_status_message(message, parse_error)
+        return
+
+    try:
+        target_path = local_path_from_text(path_text)
+    except Exception as e:
+        await open_status_message(message, f"Path tidak valid: `{e}`")
+        return
+
+    if not path_exists_or_symlink(target_path):
+        await open_status_message(message, f"Path tidak ditemukan:\n`{target_path}`")
+        return
+
+    try:
+        usage = shutil.disk_usage(str(target_path))
+    except Exception as e:
+        await open_status_message(message, f"Gagal membaca disk usage: `{e}`")
+        return
+
+    total_bytes = usage.total
+    used_bytes = usage.used
+    free_bytes = usage.free
+    used_percent = (used_bytes * 100 / total_bytes) if total_bytes > 0 else 0.0
+
+    summary = (
+        "df selesai.\n"
+        f"Path: `{target_path}`\n"
+        f"Total: `{format_bytes(float(total_bytes))}`\n"
+        f"Terpakai: `{format_bytes(float(used_bytes))}` ({used_percent:.2f}%)\n"
+        f"Sisa: `{format_bytes(float(free_bytes))}`"
+    )
+    await open_status_message(message, summary)
+
+
+@app.on_message(command_filter("mkdir"))
 async def mkdir_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /mkdir hanya di Saved Messages.")
+    if not await require_private_command_access(message, "mkdir"):
         return
 
     args = command_args(message)
     if not args:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Format:\n"
             "`/mkdir /home/runner/new-folder`\n"
             "`/mkdir \"./folder dengan spasi\"`"
@@ -1093,20 +1955,20 @@ async def mkdir_command(client: Client, message):
         if len(failed_lines) > 20:
             summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
 
-    await message.edit_text(trim_output("\n".join(summary_lines)))
+    await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
-@app.on_message(filters.me & filters.command("rm", prefixes="/"))
+@app.on_message(command_filter("rm"))
 async def remove_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /rm hanya di Saved Messages.")
+    if not await require_private_command_access(message, "rm"):
         return
 
     args = command_args(message)
     if not args:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Format:\n"
             "`/rm /home/runner/uploads/file.txt`\n"
             "`/rm /home/runner/uploads/tmp-folder`\n"
@@ -1171,20 +2033,20 @@ async def remove_command(client: Client, message):
         if len(failed_lines) > 20:
             summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
 
-    await message.edit_text(trim_output("\n".join(summary_lines)))
+    await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
-@app.on_message(filters.me & filters.command("copy", prefixes="/"))
+@app.on_message(command_filter("copy"))
 async def copy_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /copy hanya di Saved Messages.")
+    if not await require_private_command_access(message, "copy"):
         return
 
     args = command_args(message)
     if len(args) != 2:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Format:\n"
             "`/copy /home/runner/uploads/a.txt /home/runner/backup/a.txt`\n"
             "`/copy *.mp4 /home/runner/backup/videos/`\n"
@@ -1195,22 +2057,23 @@ async def copy_command(client: Client, message):
     source_text, destination_text = args
     source_paths, source_error = resolve_path_candidates(source_text)
     if source_error:
-        await message.edit_text(source_error)
+        await open_status_message(message, source_error)
         return
 
     existing_sources = [item for item in source_paths if path_exists_or_symlink(item)]
     if not existing_sources:
-        await message.edit_text(f"Source tidak ditemukan:\n`{source_text}`")
+        await open_status_message(message, f"Source tidak ditemukan:\n`{source_text}`")
         return
 
     try:
         destination_path = local_path_from_text(destination_text)
     except Exception as e:
-        await message.edit_text(f"Path tujuan tidak valid: `{e}`")
+        await open_status_message(message, f"Path tujuan tidak valid: `{e}`")
         return
 
     if len(existing_sources) > 1 and (not destination_path.exists() or not destination_path.is_dir()):
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Jika source lebih dari satu, tujuan wajib folder yang sudah ada.\n"
             f"Tujuan: `{destination_path}`"
         )
@@ -1264,20 +2127,20 @@ async def copy_command(client: Client, message):
         if len(failed_lines) > 20:
             summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
 
-    await message.edit_text(trim_output("\n".join(summary_lines)))
+    await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
-@app.on_message(filters.me & filters.command("mv", prefixes="/"))
+@app.on_message(command_filter("mv"))
 async def move_command(client: Client, message):
     del client
 
-    if not message.from_user or message.chat.id != message.from_user.id:
-        await message.edit_text("Gunakan /mv hanya di Saved Messages.")
+    if not await require_private_command_access(message, "mv"):
         return
 
     args = command_args(message)
     if len(args) != 2:
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Format:\n"
             "`/mv /home/runner/uploads/a.txt /home/runner/archive/a.txt`\n"
             "`/mv *.log /home/runner/archive/`\n"
@@ -1288,22 +2151,23 @@ async def move_command(client: Client, message):
     source_text, destination_text = args
     source_paths, source_error = resolve_path_candidates(source_text)
     if source_error:
-        await message.edit_text(source_error)
+        await open_status_message(message, source_error)
         return
 
     existing_sources = [item for item in source_paths if path_exists_or_symlink(item)]
     if not existing_sources:
-        await message.edit_text(f"Source tidak ditemukan:\n`{source_text}`")
+        await open_status_message(message, f"Source tidak ditemukan:\n`{source_text}`")
         return
 
     try:
         destination_path = local_path_from_text(destination_text)
     except Exception as e:
-        await message.edit_text(f"Path tujuan tidak valid: `{e}`")
+        await open_status_message(message, f"Path tujuan tidak valid: `{e}`")
         return
 
     if len(existing_sources) > 1 and (not destination_path.exists() or not destination_path.is_dir()):
-        await message.edit_text(
+        await open_status_message(
+            message,
             "Jika source lebih dari satu, tujuan wajib folder yang sudah ada.\n"
             f"Tujuan: `{destination_path}`"
         )
@@ -1358,18 +2222,39 @@ async def move_command(client: Client, message):
         if len(failed_lines) > 20:
             summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
 
-    await message.edit_text(trim_output("\n".join(summary_lines)))
+    await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
 if __name__ == "__main__":
-    print("Userbot manual downloader aktif.")
+    runtime_mode = "BOT TOKEN" if BOT_MODE else "USERBOT SESSION"
+    print(f"Manual downloader aktif. Mode: {runtime_mode}")
+    if BOT_MODE:
+        print(f"Owner ID: {OWNER_USER_ID if OWNER_USER_ID else '(belum diatur)'}")
+    print(f"Mode command: {'PUBLIC' if PUBLIC_MODE else 'PRIVATE'}")
     print("Langkah pakai:")
-    print("1. Forward file/video ATAU kirim link t.me ke Saved Messages.")
-    print("2. Reply pesan tersebut dengan /d1.")
-    print("3. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
-    print("4. Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
-    print("5. Batalkan upload yang sedang berjalan: /ucancel")
-    print("6. Manajemen file: /mkdir <path>, /rm <path>, /copy <source> <target>, /mv <source> <target>")
-    print(f"7. File download disimpan ke: {download_root}")
-    print(f"8. Default folder upload: {upload_root}")
+    if BOT_MODE and PUBLIC_MODE:
+        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /du /df /aria2 (/a2).")
+        print("2. Untuk /d1: balas file/video ATAU link t.me lalu kirim /d1.")
+        print("3. Cek antrian download: /dstatus atau /dqueue.")
+        print("4. Command lain hanya owner (OWNER_USER_ID): /u1 /ucancel /ls /mkdir /rm /copy /mv.")
+    elif BOT_MODE:
+        print("1. Semua command hanya owner (OWNER_USER_ID).")
+        print("2. Public command nonaktif. Aktifkan PUBLIC_MODE=1 untuk membuka /d1 /dstatus /dqueue /du /df /aria2.")
+    elif PUBLIC_MODE:
+        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /du /df /aria2 (/a2).")
+        print("2. Untuk /d1: balas file/video ATAU link t.me lalu kirim /d1.")
+        print("3. Cek antrian download: /dstatus atau /dqueue.")
+        print("4. Command lain tetap khusus Saved Messages (owner): /u1 /ucancel /ls /mkdir /rm /copy /mv.")
+    else:
+        print("1. Forward file/video ATAU kirim link t.me ke Saved Messages.")
+        print("2. Reply pesan tersebut dengan /d1.")
+        print("3. Cek antrian download: /dstatus atau /dqueue.")
+        print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
+    print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
+    print("- Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
+    print("- Cek disk: /du [-h] [path] dan /df [-h] [path]")
+    print("- Batalkan upload yang sedang berjalan: /ucancel")
+    print("- Manajemen file: /mkdir <path>, /rm <path>, /copy <source> <target>, /mv <source> <target>")
+    print(f"- File download disimpan ke: {download_root}")
+    print(f"- Default folder upload: {upload_root}")
     app.run()
