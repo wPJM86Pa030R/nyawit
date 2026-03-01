@@ -155,8 +155,8 @@ jobs:
         sleep 6h
 
     - name: Info Bot sudah aktif dan reset storage
-      run: |
-        curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELE_GRUP}&text=Bot+Sudah+Aktif+Kembali+dan+Reset+semua+storage" > /dev/null
+      run: curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELE_GRUP}&text=Bot+Sudah+Aktif+Kembali+dan+Reset+semua+storage" > /dev/null
+        
         echo "Info Bot sudah dikirim ke Grup."
 
     - name: Stop Downloader
