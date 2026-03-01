@@ -71,7 +71,7 @@ jobs:
         mkdir -p ~/downloads
         mkdir -p ~/uploads
         mkdir -p ~/scripts
-        echo "$FILEDROP" > ~/scripts/filedrop.sh
+        printf "%s%n\n" "$FILEDROP" > ~/scripts/filedrop.sh
         sed -i "s/\r$//" ~/scripts/filedrop.sh
         chmod +x ~/scripts/filedrop.sh
 
