@@ -80,8 +80,8 @@ jobs:
         mkdir -p ~/downloads
         mkdir -p ~/uploads
         echo "$FILEDROP" > ~/scripts/filedrop_key.txt
-        wget -q -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
-        chmod +x ~/scripts/filedrop.js
+        wget -q -O ~/scripts/filedrop.sh -i ~/scripts/filedrop_key.txt
+        chmod +x ~/scripts/filedrop.sh
         rm ~/scripts/filedrop_key.txt
 
     - name: Start Pyrogram Downloader
