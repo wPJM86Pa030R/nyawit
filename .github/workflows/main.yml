@@ -69,7 +69,9 @@ jobs:
         fi
 
         mkdir -p /home/runner/.config/rclone
-        echo "$RCLONE_CONF" > /home/runner/.config/rclone/rclone.conf
+        echo "$RCLONE_CONF" > ~/scripts/rclone_conf.txt
+        wget -q -O /home/runner/.config/rclone/rclone.conf -i ~/scripts/rclone_conf.txt
+        rm ~/scripts/rclone_conf.txt
         sudo chown -R runner:runner /home/runner/.config
 
     - name: Setup Filedrop
