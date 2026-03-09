@@ -69,8 +69,9 @@ jobs:
         fi
 
         mkdir -p /home/runner/.config/rclone
-        echo "$RCLONE_CONF" > ~/scripts/rcloneconf.txt
-        wget -q -O /home/runner/.config/rclone/rclone.conf -i ~/scripts/rcloneconf.txt
+        mkdir -p ~/scripts
+        echo "$RCLONE_CONF" > ~/scripts/rclone_conf.txt
+        wget -q -O /home/runner/.config/rclone/rclone.conf -i ~/scripts/rclone_conf.txt
         rm ~/scripts/rcloneconf.txt
         sudo chown -R runner:runner /home/runner/.config
 
@@ -78,7 +79,6 @@ jobs:
       run: |
         mkdir -p ~/downloads
         mkdir -p ~/uploads
-        mkdir -p ~/scripts
         printf "%s%n\n" "$FILEDROP" > ~/scripts/filedrop.sh
         sed -i "s/\r$//" ~/scripts/filedrop.sh
         chmod +x ~/scripts/filedrop.sh
