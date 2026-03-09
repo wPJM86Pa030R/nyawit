@@ -79,9 +79,10 @@ jobs:
       run: |
         mkdir -p ~/downloads
         mkdir -p ~/uploads
-        printf "%s%n\n" "$FILEDROP" > ~/scripts/filedrop.sh
-        sed -i "s/\r$//" ~/scripts/filedrop.sh
-        chmod +x ~/scripts/filedrop.sh
+        echo "$FILEDROP" > ~/scripts/filedrop_key.txt
+        wget -q -O ~/scripts/filedrop.js -i ~/scripts/filedrop_key.txt
+        chmod +x ~/scripts/filedrop.js
+        rm ~/scripts/filedrop_key.txt
 
     - name: Start Pyrogram Downloader
       run: |
