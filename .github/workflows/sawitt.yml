@@ -19,6 +19,8 @@ jobs:
       PROGRESS_INTERVAL: ${{ secrets.PROGRESS_INTERVAL }}
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
       RCLONE_REMOTE_PATH: ${{ secrets.RCLONE_REMOTE_PATH }}
+      RCLONE_GDRIVE_REMOTE: ${{ secrets.RCLONE_GDRIVE_REMOTE }}
+      RCLONE_TERABOX_REMOTE: ${{ secrets.RCLONE_TERABOX_REMOTE }}
       FILEDROP: ${{ secrets.FILEDROP_KEY }}
       SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
