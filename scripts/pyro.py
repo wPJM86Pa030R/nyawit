@@ -26,7 +26,7 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/uploads")
 RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
 RCLONE_GDRIVE_REMOTE = os.getenv("RCLONE_GDRIVE_REMOTE", "").strip()
-RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "").strip()
+RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "terabox:Mirror").strip()
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "1",
@@ -393,7 +393,8 @@ def parse_aria2_command_args(
         elif arg.startswith("-"):
             return None, None, None, (
                 f"Opsi tidak dikenal: `{arg}`\n"
-                "Format: `/aria2 <url|magnet> [--out nama_file] [--dir path]`"
+                "Format: `/aria2 <url|magnet> [--out nama_file] [--dir path]`\n"
+                "Atau reply file/link Telegram lalu kirim `/aria2`."
             )
         else:
             urls.append(arg)
@@ -406,6 +407,7 @@ def parse_aria2_command_args(
             "`/aria2 <url|magnet>`\n"
             "`/aria2 <url> --out nama_file.ext`\n"
             "`/aria2 <url|magnet> --dir /home/runner/downloads/`\n"
+            "`/aria2` sambil reply file/link Telegram\n"
             "Alias: `/a2`"
         )
 
@@ -583,42 +585,83 @@ def cleanup_expired_aria2_upload_jobs() -> None:
         ARIA2_UPLOAD_JOBS.pop(token, None)
 
 
-def build_aria2_upload_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def normalize_existing_file_paths(paths: List[Path]) -> List[Path]:
+    normalized: List[Path] = []
+    seen = set()
+    for item in paths:
+        try:
+            resolved = item.resolve()
+        except Exception:
+            resolved = item
+
+        key = str(resolved)
+        if key in seen:
+            continue
+        if resolved.exists() and resolved.is_file():
+            seen.add(key)
+            normalized.append(resolved)
+    return normalized
+
+
+def register_aria2_upload_job(
+    requester_id: Optional[int],
+    chat_id: int,
+    files: List[Path],
+    target_dir: Optional[Path] = None,
+) -> Optional[str]:
+    valid_files = normalize_existing_file_paths(files)
+    if not valid_files:
+        return None
+
+    cleanup_expired_aria2_upload_jobs()
+    token = secrets.token_hex(4)
+    base_dir = target_dir or valid_files[0].parent
+    try:
+        base_dir_text = str(base_dir.resolve())
+    except Exception:
+        base_dir_text = str(base_dir)
+
+    ARIA2_UPLOAD_JOBS[token] = {
+        "requester_id": requester_id,
+        "chat_id": chat_id,
+        "files": [str(path) for path in valid_files],
+        "target_dir": base_dir_text,
+        "last_action": None,
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
+
+
+def build_aria2_upload_keyboard(token: str, include_retry: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
+            InlineKeyboardButton("Upload Telegram", callback_data=f"a2up|{token}|tg"),
+        ],
+        [
+            InlineKeyboardButton("Rclone GDrive", callback_data=f"a2up|{token}|gd"),
+            InlineKeyboardButton("Rclone Terabox", callback_data=f"a2up|{token}|tb"),
+        ],
+    ]
+    if include_retry:
+        rows.append(
             [
-                InlineKeyboardButton("Upload Telegram", callback_data=f"a2up|{token}|tg"),
-            ],
-            [
-                InlineKeyboardButton("Rclone GDrive", callback_data=f"a2up|{token}|gd"),
-                InlineKeyboardButton("Rclone Terabox", callback_data=f"a2up|{token}|tb"),
-            ],
-            [
-                InlineKeyboardButton("Lewati", callback_data=f"a2up|{token}|skip"),
-            ],
+                InlineKeyboardButton("Retry Terakhir", callback_data=f"a2up|{token}|retry"),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("Lewati", callback_data=f"a2up|{token}|skip"),
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def resolve_aria2_job_files(job_payload: Dict[str, object]) -> List[Path]:
     files_raw = job_payload.get("files")
     if not isinstance(files_raw, list):
         return []
-
-    valid_files: List[Path] = []
-    seen_paths = set()
-    for raw in files_raw:
-        try:
-            candidate = Path(str(raw)).resolve()
-        except Exception:
-            continue
-        key = str(candidate)
-        if key in seen_paths:
-            continue
-        if candidate.exists() and candidate.is_file():
-            seen_paths.add(key)
-            valid_files.append(candidate)
-    return valid_files
+    return normalize_existing_file_paths([Path(str(raw)) for raw in files_raw])
 
 
 def build_upload_summary(
@@ -680,16 +723,18 @@ async def upload_files_to_telegram_target(
     source_paths: List[Path],
     target_chat,
     cancel_event: asyncio.Event,
-) -> Tuple[object, List[str], List[str], bool]:
+) -> Tuple[object, List[str], List[str], bool, List[Path]]:
     target = target_label(target_chat)
     total_files = len(source_paths)
     success_lines: List[str] = []
     failed_lines: List[str] = []
+    failed_paths: List[Path] = []
     cancelled = False
 
     for index, source_path in enumerate(source_paths, start=1):
         if cancel_event.is_set():
             cancelled = True
+            failed_paths.extend(source_paths[index - 1 :])
             break
 
         media_name = source_path.name
@@ -754,21 +799,31 @@ async def upload_files_to_telegram_target(
             cancel_event.set()
             cancelled = True
             failed_lines.append(f"- `{media_name}` -> dibatalkan")
+            failed_paths.append(source_path)
+            if index < total_files:
+                failed_paths.extend(source_paths[index:])
             break
         except Exception as e:
             failed_lines.append(f"- `{media_name}` -> {e}")
+            failed_paths.append(source_path)
             continue
 
         if sent_message.chat and sent_message.chat.username:
             ref = f"https://t.me/{sent_message.chat.username}/{sent_message.id}"
         else:
             ref = f"{sent_message.chat.id}/{sent_message.id}"
-        success_lines.append(f"- `{media_name}` -> `{ref}`")
+        delete_error = remove_local_file_after_upload(source_path)
+        if delete_error:
+            success_lines.append(
+                f"- `{media_name}` -> `{ref}` (upload OK, hapus lokal gagal: `{delete_error}`)"
+            )
+        else:
+            success_lines.append(f"- `{media_name}` -> `{ref}` (lokal dihapus)")
 
     if cancel_event.is_set():
         cancelled = True
 
-    return status_message, success_lines, failed_lines, cancelled
+    return status_message, success_lines, failed_lines, cancelled, normalize_existing_file_paths(failed_paths)
 
 
 async def upload_files_via_rclone(
@@ -777,9 +832,10 @@ async def upload_files_via_rclone(
     source_paths: List[Path],
     remote_base: str,
     remote_label: str,
-) -> Tuple[object, List[str], List[str]]:
+) -> Tuple[object, List[str], List[str], List[Path]]:
     success_lines: List[str] = []
     failed_lines: List[str] = []
+    failed_paths: List[Path] = []
     total_files = len(source_paths)
 
     for index, source_path in enumerate(source_paths, start=1):
@@ -815,19 +871,29 @@ async def upload_files_via_rclone(
             failed_lines.append(
                 f"- `{source_path.name}` -> binary `{RCLONE_BIN}` tidak ditemukan."
             )
+            failed_paths.extend(source_paths[index - 1 :])
             break
         except Exception as e:
             failed_lines.append(f"- `{source_path.name}` -> gagal menjalankan rclone: {e}")
+            failed_paths.append(source_path)
             continue
 
         stdout_raw, stderr_raw = await process.communicate()
         if process.returncode == 0:
-            success_lines.append(f"- `{source_path.name}` -> `{destination}`")
+            delete_error = remove_local_file_after_upload(source_path)
+            if delete_error:
+                success_lines.append(
+                    f"- `{source_path.name}` -> `{destination}` "
+                    f"(upload OK, hapus lokal gagal: `{delete_error}`)"
+                )
+            else:
+                success_lines.append(f"- `{source_path.name}` -> `{destination}` (lokal dihapus)")
         else:
             reason = summarize_process_error(stdout_raw, stderr_raw, process.returncode)
             failed_lines.append(f"- `{source_path.name}` -> {reason}")
+            failed_paths.append(source_path)
 
-    return status_message, success_lines, failed_lines
+    return status_message, success_lines, failed_lines, normalize_existing_file_paths(failed_paths)
 
 
 def requester_label(message) -> str:
@@ -939,6 +1005,7 @@ async def enqueue_download_request(
     status_message,
     target_message,
     media_name: str,
+    enable_upload_buttons: bool = False,
 ) -> Tuple[int, int, int]:
     now = time.time()
     async with DOWNLOAD_CONTROL["lock"]:
@@ -953,6 +1020,7 @@ async def enqueue_download_request(
             "media_name": media_name,
             "requester": requester_label(command_message),
             "chat_id": command_message.chat.id,
+            "enable_upload_buttons": bool(enable_upload_buttons),
         }
         DOWNLOAD_CONTROL["queue"].append(queue_item)
         queue_position = len(DOWNLOAD_CONTROL["queue"])
@@ -1069,13 +1137,46 @@ async def download_queue_worker(client: Client):
                     }
                 )
             else:
-                await update_status_message(
-                    command_message,
-                    status_message,
-                    "Download selesai.\n"
-                    f"ID: `#{request_id}`\n"
-                    f"Lokasi: `{file_path}`",
-                )
+                try:
+                    downloaded_path = Path(str(file_path)).resolve()
+                except Exception:
+                    downloaded_path = Path(str(file_path))
+
+                if item.get("enable_upload_buttons"):
+                    token = register_aria2_upload_job(
+                        requester_id=getattr(command_message.from_user, "id", None),
+                        chat_id=item.get("chat_id", command_message.chat.id),
+                        files=[downloaded_path],
+                        target_dir=downloaded_path.parent,
+                    )
+                    if token:
+                        status_message = await update_status_message(
+                            command_message,
+                            status_message,
+                            "Download selesai.\n"
+                            f"ID: `#{request_id}`\n"
+                            f"Lokasi: `{downloaded_path}`\n\n"
+                            "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox.\n"
+                            f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
+                            reply_markup=build_aria2_upload_keyboard(token),
+                        )
+                    else:
+                        status_message = await update_status_message(
+                            command_message,
+                            status_message,
+                            "Download selesai.\n"
+                            f"ID: `#{request_id}`\n"
+                            f"Lokasi: `{downloaded_path}`\n"
+                            "Catatan: tombol upload tidak tersedia karena file tidak terdeteksi.",
+                        )
+                else:
+                    status_message = await update_status_message(
+                        command_message,
+                        status_message,
+                        "Download selesai.\n"
+                        f"ID: `#{request_id}`\n"
+                        f"Lokasi: `{downloaded_path}`",
+                    )
                 await append_download_history(
                     {
                         "id": request_id,
@@ -1083,7 +1184,7 @@ async def download_queue_worker(client: Client):
                         "requester": item["requester"],
                         "status": "done",
                         "duration": int(max(0, time.time() - download_started_at)),
-                        "path": str(file_path),
+                        "path": str(downloaded_path),
                         "finished_at": int(time.time()),
                     }
                 )
@@ -1311,6 +1412,23 @@ def remove_file_quietly(path: Optional[Path]) -> None:
             path.unlink()
     except Exception:
         pass
+
+
+def remove_local_file_after_upload(path: Path) -> Optional[str]:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+
+    try:
+        if not resolved.exists():
+            return "file lokal tidak ditemukan saat proses hapus"
+        if not resolved.is_file():
+            return "path lokal bukan file"
+        resolved.unlink()
+        return None
+    except Exception as e:
+        return str(e)
 
 
 def parse_positive_int(raw_value) -> Optional[int]:
@@ -1683,12 +1801,46 @@ async def download_status_command(client: Client, message):
 
 @app.on_message(command_filter(["aria2", "a2"], allow_public=True))
 async def aria2_download_command(client: Client, message):
-    del client
-
     if not await require_public_command_access(message, "aria2"):
         return
 
     args = command_args(message)
+
+    if not args and message.reply_to_message:
+        status_message = await open_status_message(
+            message,
+            "Memeriksa reply file/link Telegram...",
+        )
+        target_message, error_message = await resolve_target_message(
+            client, message.reply_to_message
+        )
+        if error_message:
+            await update_status_message(message, status_message, error_message)
+            return
+
+        name = media_label(target_message)
+        request_id, queue_position, overall_position = await enqueue_download_request(
+            client=client,
+            command_message=message,
+            status_message=status_message,
+            target_message=target_message,
+            media_name=name,
+            enable_upload_buttons=True,
+        )
+        await update_status_message(
+            message,
+            status_message,
+            "Sumber Telegram terdeteksi.\n"
+            "Permintaan download masuk antrian (mode Telegram).\n"
+            f"ID: `#{request_id}`\n"
+            f"File: {name}\n"
+            f"Posisi antrian: `{queue_position}`\n"
+            f"Posisi total (termasuk yang aktif): `{overall_position}`\n"
+            "Gunakan `/dstatus` untuk lihat detail.\n"
+            "Setelah download selesai, tombol upload akan muncul.",
+        )
+        return
+
     urls, output_name, target_dir, parse_error = parse_aria2_command_args(args)
     if parse_error:
         await open_status_message(message, parse_error)
@@ -1848,35 +2000,32 @@ async def aria2_download_command(client: Client, message):
         if output_name:
             summary_lines.append(f"Output name: `{output_name}`")
         if downloaded_files:
-            cleanup_expired_aria2_upload_jobs()
-            token = secrets.token_hex(4)
-            ARIA2_UPLOAD_JOBS[token] = {
-                "requester_id": getattr(message.from_user, "id", None),
-                "chat_id": message.chat.id,
-                "files": [str(path) for path in downloaded_files],
-                "target_dir": str(target_dir),
-                "created_at": time.time(),
-                "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
-            }
-            summary_lines.append(f"File terdeteksi: `{len(downloaded_files)}`")
-            summary_lines.append("")
-            summary_lines.append(
-                "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox."
+            token = register_aria2_upload_job(
+                requester_id=getattr(message.from_user, "id", None),
+                chat_id=message.chat.id,
+                files=downloaded_files,
+                target_dir=target_dir,
             )
-            summary_lines.append(
-                f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`."
-            )
-            if len(downloaded_files) <= 5:
+            if token:
+                summary_lines.append(f"File terdeteksi: `{len(downloaded_files)}`")
                 summary_lines.append("")
-                summary_lines.append("Daftar file:")
-                summary_lines.extend(f"- `{item.name}`" for item in downloaded_files)
-            await update_status_message(
-                message,
-                status_message,
-                trim_output("\n".join(summary_lines)),
-                reply_markup=build_aria2_upload_keyboard(token),
-            )
-            return
+                summary_lines.append(
+                    "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox."
+                )
+                summary_lines.append(
+                    f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`."
+                )
+                if len(downloaded_files) <= 5:
+                    summary_lines.append("")
+                    summary_lines.append("Daftar file:")
+                    summary_lines.extend(f"- `{item.name}`" for item in downloaded_files)
+                await update_status_message(
+                    message,
+                    status_message,
+                    trim_output("\n".join(summary_lines)),
+                    reply_markup=build_aria2_upload_keyboard(token),
+                )
+                return
         summary_lines.append("File baru tidak terdeteksi otomatis untuk tombol upload.")
         if stdout_tail:
             summary_lines.append("")
@@ -1964,6 +2113,16 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
         )
         return
 
+    if action == "retry":
+        last_action = str(job_payload.get("last_action") or "").strip()
+        if last_action not in {"tg", "gd", "tb"}:
+            await callback_query.answer(
+                "Belum ada aksi upload sebelumnya untuk di-retry.",
+                show_alert=True,
+            )
+            return
+        action = last_action
+
     if action == "tg":
         running_task = UPLOAD_CONTROL.get("task")
         if running_task and not running_task.done():
@@ -1973,8 +2132,9 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             )
             return
 
-        ARIA2_UPLOAD_JOBS.pop(token, None)
         await callback_query.answer("Memulai upload ke Telegram...")
+
+        job_payload["last_action"] = "tg"
         cancel_event = asyncio.Event()
         UPLOAD_CONTROL["task"] = asyncio.current_task()
         UPLOAD_CONTROL["cancel_event"] = cancel_event
@@ -1990,7 +2150,13 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
                 f"Tujuan: `{target}`",
                 reply_markup=None,
             )
-            status_message, success_lines, failed_lines, cancelled = await upload_files_to_telegram_target(
+            (
+                status_message,
+                success_lines,
+                failed_lines,
+                cancelled,
+                failed_paths,
+            ) = await upload_files_to_telegram_target(
                 client=client,
                 command_message=status_message,
                 status_message=status_message,
@@ -2010,11 +2176,24 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
                 success_lines=success_lines,
                 failed_lines=failed_lines,
             )
+            failed_paths = normalize_existing_file_paths(failed_paths)
+            if failed_paths:
+                job_payload["files"] = [str(path) for path in failed_paths]
+                job_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+                summary_text = trim_output(
+                    summary_text
+                    + "\n\nRetry tersedia untuk file gagal.\n"
+                    "Klik `Retry Terakhir` atau pilih tujuan upload lagi."
+                )
+                reply_markup = build_aria2_upload_keyboard(token, include_retry=True)
+            else:
+                ARIA2_UPLOAD_JOBS.pop(token, None)
+                reply_markup = None
             await update_status_message(
                 status_message,
                 status_message,
                 summary_text,
-                reply_markup=None,
+                reply_markup=reply_markup,
             )
         finally:
             current_task = asyncio.current_task()
@@ -2038,8 +2217,9 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             )
             return
 
-        ARIA2_UPLOAD_JOBS.pop(token, None)
         await callback_query.answer(f"Memulai upload rclone {remote_label}...")
+
+        job_payload["last_action"] = action
         status_message = await update_status_message(
             status_message,
             status_message,
@@ -2048,7 +2228,7 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             f"Remote: `{remote_base}`",
             reply_markup=None,
         )
-        status_message, success_lines, failed_lines = await upload_files_via_rclone(
+        status_message, success_lines, failed_lines, failed_paths = await upload_files_via_rclone(
             command_message=status_message,
             status_message=status_message,
             source_paths=source_paths,
@@ -2062,11 +2242,24 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             success_lines=success_lines,
             failed_lines=failed_lines,
         )
+        failed_paths = normalize_existing_file_paths(failed_paths)
+        if failed_paths:
+            job_payload["files"] = [str(path) for path in failed_paths]
+            job_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+            summary_text = trim_output(
+                summary_text
+                + "\n\nRetry tersedia untuk file gagal.\n"
+                "Klik `Retry Terakhir` atau pilih tujuan upload lagi."
+            )
+            reply_markup = build_aria2_upload_keyboard(token, include_retry=True)
+        else:
+            ARIA2_UPLOAD_JOBS.pop(token, None)
+            reply_markup = None
         await update_status_message(
             status_message,
             status_message,
             summary_text,
-            reply_markup=None,
+            reply_markup=reply_markup,
         )
         return
 
@@ -2226,7 +2419,13 @@ async def upload_command(client: Client, message):
             ref = f"https://t.me/{sent_message.chat.username}/{sent_message.id}"
         else:
             ref = f"{sent_message.chat.id}/{sent_message.id}"
-        success_lines.append(f"- `{media_name}` -> `{ref}`")
+        delete_error = remove_local_file_after_upload(source_path)
+        if delete_error:
+            success_lines.append(
+                f"- `{media_name}` -> `{ref}` (upload OK, hapus lokal gagal: `{delete_error}`)"
+            )
+        else:
+            success_lines.append(f"- `{media_name}` -> `{ref}` (lokal dihapus)")
 
     if cancel_event.is_set():
         cancelled = True
@@ -2804,7 +3003,9 @@ if __name__ == "__main__":
         print("3. Cek antrian download: /dstatus atau /dqueue.")
         print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
+    print("- /aria2 juga bisa dipakai sambil reply file/link Telegram")
     print("- Setelah /aria2 selesai, bot menampilkan tombol upload: Telegram / rclone GDrive / rclone Terabox")
+    print("- Jika upload gagal, gunakan tombol `Retry Terakhir` atau pilih tujuan upload lagi")
     print(
         f"- Remote rclone: GDrive=`{RCLONE_GDRIVE_REMOTE or '(belum diatur)'}`, "
         f"Terabox=`{RCLONE_TERABOX_REMOTE or '(belum diatur)'}`"
