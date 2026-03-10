@@ -8,11 +8,13 @@ import datetime
 import json
 import glob
 import tempfile
+import secrets
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageIdInvalid
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -22,6 +24,9 @@ OWNER_USER_ID_RAW = os.getenv("OWNER_USER_ID", "").strip()
 ARIA2_BIN = os.getenv("ARIA2_BIN", "aria2c")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/uploads")
+RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
+RCLONE_GDRIVE_REMOTE = os.getenv("RCLONE_GDRIVE_REMOTE", "").strip()
+RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "tbox:Mirror").strip()
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "1",
@@ -29,6 +34,11 @@ PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "yes",
     "on",
 }
+
+try:
+    ARIA2_BUTTON_TTL_SECONDS = max(60, int(os.getenv("ARIA2_BUTTON_TTL_SECONDS", "3600")))
+except ValueError:
+    ARIA2_BUTTON_TTL_SECONDS = 3600
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID dan API_HASH wajib diisi.")
@@ -105,6 +115,7 @@ DOWNLOAD_CONTROL = {
     "current": None,
     "history": [],
 }
+ARIA2_UPLOAD_JOBS: Dict[str, Dict[str, object]] = {}
 
 
 def command_filter(name: str, allow_public: bool = False):
@@ -481,6 +492,344 @@ async def collect_aria2_stream(
     progress_state[tail_key] = ""
 
 
+def snapshot_directory_file_state(root: Path) -> Dict[str, Tuple[int, int]]:
+    snapshot: Dict[str, Tuple[int, int]] = {}
+    try:
+        candidates = [root] if root.is_file() else root.rglob("*")
+    except Exception:
+        return snapshot
+
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            if path.name.endswith(".aria2"):
+                continue
+            resolved = path.resolve()
+            stat_info = resolved.stat()
+            snapshot[str(resolved)] = (int(stat_info.st_size), int(stat_info.st_mtime_ns))
+        except Exception:
+            continue
+    return snapshot
+
+
+def detect_aria2_downloaded_files(
+    target_dir: Path,
+    before_snapshot: Dict[str, Tuple[int, int]],
+    started_at: float,
+    output_name: Optional[str] = None,
+) -> List[Path]:
+    found_files: List[Path] = []
+    seen_paths = set()
+
+    if output_name:
+        preferred_path = (target_dir / output_name).resolve()
+        if preferred_path.exists() and preferred_path.is_file():
+            key = str(preferred_path)
+            seen_paths.add(key)
+            found_files.append(preferred_path)
+
+    try:
+        candidates = [target_dir] if target_dir.is_file() else target_dir.rglob("*")
+    except Exception:
+        return found_files
+
+    for path in candidates:
+        try:
+            if not path.is_file() or path.name.endswith(".aria2"):
+                continue
+
+            resolved = path.resolve()
+            key = str(resolved)
+            stat_info = resolved.stat()
+            current_size = int(stat_info.st_size)
+            current_mtime_ns = int(stat_info.st_mtime_ns)
+            current_mtime = float(stat_info.st_mtime)
+            previous = before_snapshot.get(key)
+
+            changed = False
+            if previous is None:
+                changed = current_mtime >= (started_at - 2.0)
+            else:
+                previous_size, previous_mtime_ns = previous
+                if current_size != previous_size or current_mtime_ns > previous_mtime_ns:
+                    changed = current_mtime >= (started_at - 2.0)
+
+            if changed and key not in seen_paths:
+                seen_paths.add(key)
+                found_files.append(resolved)
+        except Exception:
+            continue
+
+    def sort_key(item: Path):
+        try:
+            mtime = item.stat().st_mtime if item.exists() else 0.0
+        except Exception:
+            mtime = 0.0
+        return (mtime, item.name.lower())
+
+    found_files.sort(key=sort_key)
+    return found_files
+
+
+def cleanup_expired_aria2_upload_jobs() -> None:
+    now = time.time()
+    expired_tokens = []
+    for token, payload in ARIA2_UPLOAD_JOBS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        ARIA2_UPLOAD_JOBS.pop(token, None)
+
+
+def build_aria2_upload_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Upload Telegram", callback_data=f"a2up|{token}|tg"),
+            ],
+            [
+                InlineKeyboardButton("Rclone GDrive", callback_data=f"a2up|{token}|gd"),
+                InlineKeyboardButton("Rclone Terabox", callback_data=f"a2up|{token}|tb"),
+            ],
+            [
+                InlineKeyboardButton("Lewati", callback_data=f"a2up|{token}|skip"),
+            ],
+        ]
+    )
+
+
+def resolve_aria2_job_files(job_payload: Dict[str, object]) -> List[Path]:
+    files_raw = job_payload.get("files")
+    if not isinstance(files_raw, list):
+        return []
+
+    valid_files: List[Path] = []
+    seen_paths = set()
+    for raw in files_raw:
+        try:
+            candidate = Path(str(raw)).resolve()
+        except Exception:
+            continue
+        key = str(candidate)
+        if key in seen_paths:
+            continue
+        if candidate.exists() and candidate.is_file():
+            seen_paths.add(key)
+            valid_files.append(candidate)
+    return valid_files
+
+
+def build_upload_summary(
+    summary_title: str,
+    target_text: str,
+    total_files: int,
+    success_lines: List[str],
+    failed_lines: List[str],
+) -> str:
+    summary_lines = [
+        summary_title,
+        f"Tujuan: `{target_text}`",
+        f"Total file: `{total_files}`",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} file lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} file lain.")
+
+    return trim_output("\n".join(summary_lines))
+
+
+def build_rclone_destination(remote_base: str, file_name: str) -> str:
+    base = remote_base.strip()
+    if base.endswith(":") or base.endswith("/"):
+        return f"{base}{file_name}"
+    return f"{base}/{file_name}"
+
+
+def summarize_process_error(stdout_raw: bytes, stderr_raw: bytes, return_code: int) -> str:
+    stderr_text = stderr_raw.decode("utf-8", errors="ignore").strip()
+    stdout_text = stdout_raw.decode("utf-8", errors="ignore").strip()
+    merged = stderr_text or stdout_text
+    if not merged:
+        return f"return code {return_code}"
+
+    lines = [line.strip() for line in merged.splitlines() if line.strip()]
+    if not lines:
+        return f"return code {return_code}"
+    return trim_output(lines[-1])[:200]
+
+
+async def upload_files_to_telegram_target(
+    client: Client,
+    command_message,
+    status_message,
+    source_paths: List[Path],
+    target_chat,
+    cancel_event: asyncio.Event,
+) -> Tuple[object, List[str], List[str], bool]:
+    target = target_label(target_chat)
+    total_files = len(source_paths)
+    success_lines: List[str] = []
+    failed_lines: List[str] = []
+    cancelled = False
+
+    for index, source_path in enumerate(source_paths, start=1):
+        if cancel_event.is_set():
+            cancelled = True
+            break
+
+        media_name = source_path.name
+        state = {"started_at": time.time(), "last_tick": 0.0, "cancel_event": cancel_event}
+
+        status_message = await update_status_message(
+            command_message,
+            status_message,
+            "Upload berjalan\n"
+            f"File: `{index}/{total_files}`\n"
+            f"Nama: `{media_name}`\n"
+            f"Sumber: `{source_path}`\n"
+            f"Tujuan: `{target}`"
+        )
+
+        try:
+            suffix = source_path.suffix.lower()
+            if suffix in VIDEO_EXTENSIONS:
+                video_kwargs = {
+                    "chat_id": target_chat,
+                    "video": str(source_path),
+                    "caption": f"`{media_name}`",
+                    "supports_streaming": True,
+                    "progress": upload_progress_callback,
+                    "progress_args": (status_message, media_name, state),
+                }
+                video_metadata = await probe_video_metadata(source_path)
+                for key in ("duration", "width", "height"):
+                    value = video_metadata.get(key)
+                    if value:
+                        video_kwargs[key] = value
+
+                if "duration" not in video_kwargs:
+                    print(
+                        f"[WARN] Durasi video tidak terdeteksi untuk {source_path}. "
+                        "Telegram bisa menampilkan durasi 0:00."
+                    )
+
+                thumb_path = await generate_video_thumbnail(source_path)
+                if thumb_path:
+                    video_kwargs["thumb"] = str(thumb_path)
+                else:
+                    print(
+                        f"[WARN] Thumbnail tidak berhasil dibuat untuk {source_path.name}. "
+                        "Telegram mungkin menampilkan preview kosong."
+                    )
+
+                try:
+                    sent_message = await client.send_video(**video_kwargs)
+                finally:
+                    if thumb_path:
+                        remove_file_quietly(thumb_path)
+            else:
+                sent_message = await client.send_document(
+                    chat_id=target_chat,
+                    document=str(source_path),
+                    caption=f"`{media_name}`",
+                    progress=upload_progress_callback,
+                    progress_args=(status_message, media_name, state),
+                )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            cancelled = True
+            failed_lines.append(f"- `{media_name}` -> dibatalkan")
+            break
+        except Exception as e:
+            failed_lines.append(f"- `{media_name}` -> {e}")
+            continue
+
+        if sent_message.chat and sent_message.chat.username:
+            ref = f"https://t.me/{sent_message.chat.username}/{sent_message.id}"
+        else:
+            ref = f"{sent_message.chat.id}/{sent_message.id}"
+        success_lines.append(f"- `{media_name}` -> `{ref}`")
+
+    if cancel_event.is_set():
+        cancelled = True
+
+    return status_message, success_lines, failed_lines, cancelled
+
+
+async def upload_files_via_rclone(
+    command_message,
+    status_message,
+    source_paths: List[Path],
+    remote_base: str,
+    remote_label: str,
+) -> Tuple[object, List[str], List[str]]:
+    success_lines: List[str] = []
+    failed_lines: List[str] = []
+    total_files = len(source_paths)
+
+    for index, source_path in enumerate(source_paths, start=1):
+        destination = build_rclone_destination(remote_base, source_path.name)
+        status_message = await update_status_message(
+            command_message,
+            status_message,
+            "Rclone upload berjalan\n"
+            f"File: `{index}/{total_files}`\n"
+            f"Nama: `{source_path.name}`\n"
+            f"Sumber: `{source_path}`\n"
+            f"Tujuan: `{destination}`\n"
+            f"Remote: `{remote_label}`"
+        )
+
+        command = [
+            RCLONE_BIN,
+            "copyto",
+            str(source_path),
+            destination,
+            "--stats=1s",
+            "--stats-one-line",
+            "--retries=2",
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            failed_lines.append(
+                f"- `{source_path.name}` -> binary `{RCLONE_BIN}` tidak ditemukan."
+            )
+            break
+        except Exception as e:
+            failed_lines.append(f"- `{source_path.name}` -> gagal menjalankan rclone: {e}")
+            continue
+
+        stdout_raw, stderr_raw = await process.communicate()
+        if process.returncode == 0:
+            success_lines.append(f"- `{source_path.name}` -> `{destination}`")
+        else:
+            reason = summarize_process_error(stdout_raw, stderr_raw, process.returncode)
+            failed_lines.append(f"- `{source_path.name}` -> {reason}")
+
+    return status_message, success_lines, failed_lines
+
+
 def requester_label(message) -> str:
     user = getattr(message, "from_user", None)
     if not user:
@@ -543,28 +892,28 @@ async def require_public_command_access(message, command_name: str) -> bool:
     return True
 
 
-async def open_status_message(message, text: str):
+async def open_status_message(message, text: str, reply_markup=None):
     if BOT_MODE:
-        return await message.reply_text(text)
+        return await message.reply_text(text, reply_markup=reply_markup)
 
     if not PUBLIC_MODE or getattr(message, "outgoing", False):
         try:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=reply_markup)
             return message
         except Exception:
             pass
-    return await message.reply_text(text)
+    return await message.reply_text(text, reply_markup=reply_markup)
 
 
-async def update_status_message(command_message, status_message, text: str):
+async def update_status_message(command_message, status_message, text: str, reply_markup=None):
     try:
-        await status_message.edit_text(text)
+        await status_message.edit_text(text, reply_markup=reply_markup)
         return status_message
     except Exception:
         pass
 
     try:
-        return await command_message.reply_text(text)
+        return await command_message.reply_text(text, reply_markup=reply_markup)
     except Exception:
         return status_message
 
@@ -1355,6 +1704,8 @@ async def aria2_download_command(client: Client, message):
         await open_status_message(message, f"Gagal membuat folder target: `{e}`")
         return
 
+    before_snapshot = snapshot_directory_file_state(target_dir)
+
     command = [
         ARIA2_BIN,
         "--dir",
@@ -1482,6 +1833,12 @@ async def aria2_download_command(client: Client, message):
     stderr_tail = "\n".join(stderr_text.splitlines()[-12:]) if stderr_text else ""
 
     if process.returncode == 0:
+        downloaded_files = detect_aria2_downloaded_files(
+            target_dir=target_dir,
+            before_snapshot=before_snapshot,
+            started_at=started_at,
+            output_name=output_name,
+        )
         summary_lines = [
             "Aria2 selesai.",
             f"Target folder: `{target_dir}`",
@@ -1490,6 +1847,37 @@ async def aria2_download_command(client: Client, message):
         ]
         if output_name:
             summary_lines.append(f"Output name: `{output_name}`")
+        if downloaded_files:
+            cleanup_expired_aria2_upload_jobs()
+            token = secrets.token_hex(4)
+            ARIA2_UPLOAD_JOBS[token] = {
+                "requester_id": getattr(message.from_user, "id", None),
+                "chat_id": message.chat.id,
+                "files": [str(path) for path in downloaded_files],
+                "target_dir": str(target_dir),
+                "created_at": time.time(),
+                "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+            }
+            summary_lines.append(f"File terdeteksi: `{len(downloaded_files)}`")
+            summary_lines.append("")
+            summary_lines.append(
+                "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox."
+            )
+            summary_lines.append(
+                f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`."
+            )
+            if len(downloaded_files) <= 5:
+                summary_lines.append("")
+                summary_lines.append("Daftar file:")
+                summary_lines.extend(f"- `{item.name}`" for item in downloaded_files)
+            await update_status_message(
+                message,
+                status_message,
+                trim_output("\n".join(summary_lines)),
+                reply_markup=build_aria2_upload_keyboard(token),
+            )
+            return
+        summary_lines.append("File baru tidak terdeteksi otomatis untuk tombol upload.")
         if stdout_tail:
             summary_lines.append("")
             summary_lines.append("Ringkasan aria2 (stdout):")
@@ -1518,6 +1906,171 @@ async def aria2_download_command(client: Client, message):
         failed_lines.append(stdout_tail)
         failed_lines.append("```")
     await update_status_message(message, status_message, trim_output("\n".join(failed_lines)))
+
+
+@app.on_callback_query(filters.regex(r"^a2up\|"))
+async def aria2_upload_choice_callback(client: Client, callback_query):
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, action = parts
+    cleanup_expired_aria2_upload_jobs()
+    job_payload = ARIA2_UPLOAD_JOBS.get(token)
+    if not job_payload:
+        await callback_query.answer("Tombol upload sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = job_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /aria2.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    source_paths = resolve_aria2_job_files(job_payload)
+    if not source_paths:
+        ARIA2_UPLOAD_JOBS.pop(token, None)
+        await callback_query.answer("File hasil aria2 tidak ditemukan lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Aksi upload dibatalkan: file hasil aria2 sudah tidak tersedia.",
+            reply_markup=None,
+        )
+        return
+
+    if action == "skip":
+        ARIA2_UPLOAD_JOBS.pop(token, None)
+        await callback_query.answer("Upload lanjutan dilewati.")
+        base_text = (status_message.text or "").strip()
+        final_text = (
+            f"{base_text}\n\nUpload lanjutan: dilewati."
+            if base_text
+            else "Upload lanjutan: dilewati."
+        )
+        await update_status_message(
+            status_message,
+            status_message,
+            trim_output(final_text),
+            reply_markup=None,
+        )
+        return
+
+    if action == "tg":
+        running_task = UPLOAD_CONTROL.get("task")
+        if running_task and not running_task.done():
+            await callback_query.answer(
+                "Masih ada upload Telegram aktif. Gunakan /ucancel dulu.",
+                show_alert=True,
+            )
+            return
+
+        ARIA2_UPLOAD_JOBS.pop(token, None)
+        await callback_query.answer("Memulai upload ke Telegram...")
+        cancel_event = asyncio.Event()
+        UPLOAD_CONTROL["task"] = asyncio.current_task()
+        UPLOAD_CONTROL["cancel_event"] = cancel_event
+
+        target_chat = job_payload.get("chat_id", status_message.chat.id)
+        target = target_label(target_chat)
+        try:
+            status_message = await update_status_message(
+                status_message,
+                status_message,
+                "Memulai upload hasil aria2 ke Telegram...\n"
+                f"Total file: `{len(source_paths)}`\n"
+                f"Tujuan: `{target}`",
+                reply_markup=None,
+            )
+            status_message, success_lines, failed_lines, cancelled = await upload_files_to_telegram_target(
+                client=client,
+                command_message=status_message,
+                status_message=status_message,
+                source_paths=source_paths,
+                target_chat=target_chat,
+                cancel_event=cancel_event,
+            )
+            summary_title = (
+                "Upload hasil aria2 ke Telegram dibatalkan."
+                if cancelled
+                else "Upload hasil aria2 ke Telegram selesai."
+            )
+            summary_text = build_upload_summary(
+                summary_title=summary_title,
+                target_text=target,
+                total_files=len(source_paths),
+                success_lines=success_lines,
+                failed_lines=failed_lines,
+            )
+            await update_status_message(
+                status_message,
+                status_message,
+                summary_text,
+                reply_markup=None,
+            )
+        finally:
+            current_task = asyncio.current_task()
+            if UPLOAD_CONTROL.get("task") is current_task:
+                UPLOAD_CONTROL["task"] = None
+                UPLOAD_CONTROL["cancel_event"] = None
+        return
+
+    if action in {"gd", "tb"}:
+        if action == "gd":
+            remote_base = RCLONE_GDRIVE_REMOTE
+            remote_label = "Google Drive"
+        else:
+            remote_base = RCLONE_TERABOX_REMOTE
+            remote_label = "Terabox"
+
+        if not remote_base:
+            await callback_query.answer(
+                f"Remote rclone {remote_label} belum diatur di env.",
+                show_alert=True,
+            )
+            return
+
+        ARIA2_UPLOAD_JOBS.pop(token, None)
+        await callback_query.answer(f"Memulai upload rclone {remote_label}...")
+        status_message = await update_status_message(
+            status_message,
+            status_message,
+            "Memulai upload hasil aria2 via rclone...\n"
+            f"Total file: `{len(source_paths)}`\n"
+            f"Remote: `{remote_base}`",
+            reply_markup=None,
+        )
+        status_message, success_lines, failed_lines = await upload_files_via_rclone(
+            command_message=status_message,
+            status_message=status_message,
+            source_paths=source_paths,
+            remote_base=remote_base,
+            remote_label=remote_label,
+        )
+        summary_text = build_upload_summary(
+            summary_title=f"Upload hasil aria2 via rclone {remote_label} selesai.",
+            target_text=remote_base,
+            total_files=len(source_paths),
+            success_lines=success_lines,
+            failed_lines=failed_lines,
+        )
+        await update_status_message(
+            status_message,
+            status_message,
+            summary_text,
+            reply_markup=None,
+        )
+        return
+
+    await callback_query.answer("Aksi tombol tidak dikenal.", show_alert=True)
 
 
 @app.on_message(command_filter("u1"))
@@ -2251,6 +2804,11 @@ if __name__ == "__main__":
         print("3. Cek antrian download: /dstatus atau /dqueue.")
         print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
+    print("- Setelah /aria2 selesai, bot menampilkan tombol upload: Telegram / rclone GDrive / rclone Terabox")
+    print(
+        f"- Remote rclone: GDrive=`{RCLONE_GDRIVE_REMOTE or '(belum diatur)'}`, "
+        f"Terabox=`{RCLONE_TERABOX_REMOTE or '(belum diatur)'}`"
+    )
     print("- Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
     print("- Cek disk: /du [-h] [path] dan /df [-h] [path]")
     print("- Batalkan upload yang sedang berjalan: /ucancel")
