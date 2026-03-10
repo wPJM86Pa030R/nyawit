@@ -94,6 +94,11 @@ OPENMESSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+EXTERNAL_LINK_RE = re.compile(
+    r"(magnet:\?[^\s]+|https?://[^\s<>\"'`]+|ftp://[^\s<>\"'`]+)",
+    re.IGNORECASE,
+)
+
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".mkv",
@@ -181,6 +186,26 @@ def parse_telegram_link(text: Optional[str]) -> Optional[Tuple[object, int]]:
         return chat_id_raw, message_id
 
     return None
+
+
+def extract_non_telegram_links(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+
+    found: List[str] = []
+    seen = set()
+    for raw_link in EXTERNAL_LINK_RE.findall(text):
+        link = raw_link.strip().rstrip(".,;:!?)\"'`]>")
+        if not link:
+            continue
+        if parse_telegram_link(link):
+            continue
+        key = link.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(key)
+    return found
 
 
 def has_downloadable_media(message) -> bool:
@@ -350,6 +375,7 @@ def parse_disk_command_target(command_name: str, args: List[str]) -> Tuple[Optio
 
 def parse_aria2_command_args(
     args: List[str],
+    fallback_urls: Optional[List[str]] = None,
 ) -> Tuple[Optional[List[str]], Optional[str], Optional[Path], Optional[str]]:
     urls: List[str] = []
     output_name: Optional[str] = None
@@ -394,12 +420,15 @@ def parse_aria2_command_args(
             return None, None, None, (
                 f"Opsi tidak dikenal: `{arg}`\n"
                 "Format: `/aria2 <url|magnet> [--out nama_file] [--dir path]`\n"
-                "Atau reply file/link Telegram lalu kirim `/aria2`."
+                "Atau reply link direct (http/https/ftp/magnet) lalu kirim `/aria2`."
             )
         else:
             urls.append(arg)
 
         i += 1
+
+    if not urls and fallback_urls:
+        urls.extend(item.strip() for item in fallback_urls if item and item.strip())
 
     if not urls:
         return None, None, None, (
@@ -407,7 +436,7 @@ def parse_aria2_command_args(
             "`/aria2 <url|magnet>`\n"
             "`/aria2 <url> --out nama_file.ext`\n"
             "`/aria2 <url|magnet> --dir /home/runner/downloads/`\n"
-            "`/aria2` sambil reply file/link Telegram\n"
+            "`/aria2` sambil reply link direct (http/https/ftp/magnet)\n"
             "Alias: `/a2`"
         )
 
@@ -1805,43 +1834,23 @@ async def aria2_download_command(client: Client, message):
         return
 
     args = command_args(message)
+    reply_message = message.reply_to_message
+    reply_text = (reply_message.text or reply_message.caption or "").strip() if reply_message else ""
+    reply_non_telegram_links = extract_non_telegram_links(reply_text) if reply_message else []
 
-    if not args and message.reply_to_message:
-        status_message = await open_status_message(
-            message,
-            "Memeriksa reply file/link Telegram...",
-        )
-        target_message, error_message = await resolve_target_message(
-            client, message.reply_to_message
-        )
-        if error_message:
-            await update_status_message(message, status_message, error_message)
+    if not args and reply_message:
+        if (has_downloadable_media(reply_message) or parse_telegram_link(reply_text)) and not reply_non_telegram_links:
+            await open_status_message(
+                message,
+                "Untuk file/link Telegram, gunakan `/d1`.\n"
+                "`/aria2` khusus link direct (http/https/ftp/magnet).",
+            )
             return
 
-        name = media_label(target_message)
-        request_id, queue_position, overall_position = await enqueue_download_request(
-            client=client,
-            command_message=message,
-            status_message=status_message,
-            target_message=target_message,
-            media_name=name,
-            enable_upload_buttons=True,
-        )
-        await update_status_message(
-            message,
-            status_message,
-            "Sumber Telegram terdeteksi.\n"
-            "Permintaan download masuk antrian (mode Telegram).\n"
-            f"ID: `#{request_id}`\n"
-            f"File: {name}\n"
-            f"Posisi antrian: `{queue_position}`\n"
-            f"Posisi total (termasuk yang aktif): `{overall_position}`\n"
-            "Gunakan `/dstatus` untuk lihat detail.\n"
-            "Setelah download selesai, tombol upload akan muncul.",
-        )
-        return
-
-    urls, output_name, target_dir, parse_error = parse_aria2_command_args(args)
+    urls, output_name, target_dir, parse_error = parse_aria2_command_args(
+        args,
+        fallback_urls=reply_non_telegram_links if reply_message else None,
+    )
     if parse_error:
         await open_status_message(message, parse_error)
         return
@@ -3003,7 +3012,7 @@ if __name__ == "__main__":
         print("3. Cek antrian download: /dstatus atau /dqueue.")
         print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
-    print("- /aria2 juga bisa dipakai sambil reply file/link Telegram")
+    print("- /aria2 juga bisa dipakai sambil reply link direct (http/https/ftp/magnet)")
     print("- Setelah /aria2 selesai, bot menampilkan tombol upload: Telegram / rclone GDrive / rclone Terabox")
     print("- Jika upload gagal, gunakan tombol `Retry Terakhir` atau pilih tujuan upload lagi")
     print(
