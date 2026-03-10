@@ -58,8 +58,16 @@ jobs:
         sudo install -m 755 rclone-v1.73.1-linux-amd64/rclone /usr/local/bin/rclone
         rclone version
 
-        python -m pip install --upgrade pip
-        pip install pyrogram tgcrypto
+        python3 -m pip install --upgrade pip
+        python3 -m pip install --user pyrogram tgcrypto gallery-dl
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
+        if ! command -v gallery-dl >/dev/null 2>&1; then
+          echo "gallery-dl belum ada di PATH, mencoba install global..."
+          python3 -m pip install pyrogram tgcrypto gallery-dl
+        fi
+        command -v gallery-dl
+        gallery-dl --version | head -n 1
 
     - name: Setup Variable Environments
       run: |
@@ -68,6 +76,12 @@ jobs:
         fi
         if [ -z "$PROGRESS_INTERVAL" ]; then
           echo "PROGRESS_INTERVAL=5" >> "$GITHUB_ENV"
+        fi
+        if command -v gallery-dl >/dev/null 2>&1; then
+          echo "GALLERY_DL_BIN=$(command -v gallery-dl)" >> "$GITHUB_ENV"
+        else
+          echo "gallery-dl tidak ditemukan setelah instalasi."
+          exit 1
         fi
 
         mkdir -p /home/runner/.config/rclone
