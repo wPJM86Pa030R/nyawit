@@ -28,8 +28,14 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/downloads")
 RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
 RCLONE_GDRIVE_REMOTE = os.getenv("RCLONE_GDRIVE_REMOTE", "").strip()
-RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "").strip()
+RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "terabox:Mirror").strip()
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
+try:
+    RCLONE_COMMAND_TIMEOUT_SECONDS = max(
+        30, int(os.getenv("RCLONE_COMMAND_TIMEOUT_SECONDS", "900"))
+    )
+except ValueError:
+    RCLONE_COMMAND_TIMEOUT_SECONDS = 900
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "1",
     "true",
@@ -385,15 +391,18 @@ def command_args(message):
 
 
 def parse_disk_command_target(command_name: str, args: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    del command_name
+
+    options_ended = False
     path_parts = []
     for arg in args:
-        if arg in {"-h", "--human-readable"}:
+        if not options_ended and arg == "--":
+            options_ended = True
             continue
-        if arg.startswith("-"):
-            return None, (
-                f"Opsi tidak dikenal: `{arg}`\n"
-                f"Format: `/{command_name} [-h] [path]`"
-            )
+        if not options_ended and arg.startswith("-"):
+            # Kompatibilitas: terima opsi apa pun seperti command shell, lalu abaikan.
+            # Contoh: /du -h, /df --si, dst.
+            continue
         path_parts.append(arg)
     return " ".join(path_parts).strip() or ".", None
 
@@ -1503,7 +1512,7 @@ async def require_whitelist_admin_access(message, command_name: str) -> bool:
     if not PKILL_ADMIN_USER_IDS:
         await open_status_message(
             message,
-            "Whitelist admin `/pkill` kosong.\n"
+            "Whitelist admin command kosong.\n"
             "Set env `PKILL_ADMIN_IDS` dengan daftar user ID (pisahkan koma/spasi).",
         )
         return False
@@ -1516,6 +1525,42 @@ async def require_whitelist_admin_access(message, command_name: str) -> bool:
         f"Kamu tidak ada di whitelist admin `/{command_name}`.",
     )
     return False
+
+
+def is_whitelist_admin_user(message) -> bool:
+    actor = getattr(message, "from_user", None)
+    if not actor:
+        return False
+    return actor.id in PKILL_ADMIN_USER_IDS
+
+
+async def require_owner_or_whitelist_access(message, command_name: str) -> bool:
+    if is_whitelist_admin_user(message):
+        return True
+
+    if BOT_MODE:
+        if not OWNER_USER_ID:
+            await open_status_message(
+                message,
+                "OWNER_USER_ID belum diatur.\n"
+                f"Perintah /{command_name} butuh owner bot atau user whitelist `PKILL_ADMIN_IDS`.",
+            )
+            return False
+        if is_owner_in_bot_mode(message):
+            return True
+        await open_status_message(
+            message,
+            f"Perintah /{command_name} hanya untuk owner bot atau user whitelist `PKILL_ADMIN_IDS`.",
+        )
+        return False
+
+    if is_saved_messages_only_violation(message):
+        await open_status_message(
+            message,
+            f"Gunakan /{command_name} hanya di Saved Messages, atau pakai akun yang ada di whitelist `PKILL_ADMIN_IDS`.",
+        )
+        return False
+    return True
 
 
 async def open_status_message(message, text: str, reply_markup=None):
@@ -3358,6 +3403,123 @@ async def upload_command(client: Client, message):
     )
 
 
+@app.on_message(command_filter("ps", allow_public=True))
+async def ps_command(client: Client, message):
+    del client
+
+    if not await require_public_command_access(message, "ps"):
+        return
+
+    args = command_args(message)
+    if not args:
+        await open_status_message(
+            message,
+            "Format:\n"
+            "`/ps <nama_proses|pid>`\n"
+            "Contoh:\n"
+            "`/ps aria2`\n"
+            "`/ps 12345`",
+        )
+        return
+
+    query = " ".join(args).strip()
+    if not query:
+        await open_status_message(message, "Query `/ps` tidak boleh kosong.")
+        return
+
+    status_message = await open_status_message(
+        message,
+        f"Mencari proses dengan query: `{query}` ...",
+    )
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ps",
+            "aux",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        await update_status_message(
+            message,
+            status_message,
+            "Command `ps` tidak ditemukan di sistem.",
+        )
+        return
+    except Exception as e:
+        await update_status_message(
+            message,
+            status_message,
+            f"Gagal menjalankan `ps aux`: `{e}`",
+        )
+        return
+
+    stdout_raw, stderr_raw = await process.communicate()
+    stdout_text = stdout_raw.decode("utf-8", errors="ignore").strip()
+    stderr_text = stderr_raw.decode("utf-8", errors="ignore").strip()
+    if process.returncode != 0:
+        error_text = stderr_text or stdout_text or f"return code {process.returncode}"
+        await update_status_message(
+            message,
+            status_message,
+            trim_output(f"Gagal menjalankan `ps aux`: `{error_text}`"),
+        )
+        return
+
+    lines = stdout_text.splitlines()
+    if not lines:
+        await update_status_message(
+            message,
+            status_message,
+            "Output `ps aux` kosong.",
+        )
+        return
+
+    header = lines[0]
+    query_lower = query.lower()
+    query_is_pid = query.isdigit()
+    matched_lines: List[str] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        lowered = line.lower()
+        if query_lower in lowered:
+            matched_lines.append(line)
+            continue
+        if query_is_pid:
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[1] == query:
+                matched_lines.append(line)
+
+    if not matched_lines:
+        await update_status_message(
+            message,
+            status_message,
+            "Tidak ada proses yang cocok.\n"
+            f"Query: `{query}`",
+        )
+        return
+
+    max_lines = 40
+    shown_lines = matched_lines[:max_lines]
+    output_lines = [
+        f"Hasil `ps aux | grep {query}`",
+        f"Total cocok: `{len(matched_lines)}`",
+        "```text",
+        header,
+        *shown_lines,
+        "```",
+    ]
+    if len(matched_lines) > max_lines:
+        output_lines.append(f"Catatan: ditampilkan {max_lines} dari {len(matched_lines)} proses.")
+
+    await update_status_message(
+        message,
+        status_message,
+        trim_output("\n".join(output_lines)),
+    )
+
+
 @app.on_message(command_filter("pkill"))
 async def pkill_command(client: Client, message):
     del client
@@ -3460,6 +3622,106 @@ async def pkill_command(client: Client, message):
     await update_status_message(message, status_message, trim_output("\n".join(result_lines)))
 
 
+@app.on_message(command_filter("rclone"))
+async def rclone_command(client: Client, message):
+    del client
+
+    if not await require_owner_or_whitelist_access(message, "rclone"):
+        return
+
+    args = command_args(message)
+    if not args:
+        await open_status_message(
+            message,
+            "Format:\n"
+            "`/rclone <subcommand> [opsi]`\n"
+            "Contoh:\n"
+            "`/rclone ls terabox:Mirror`\n"
+            "`/rclone copy /home/runner/downloads terabox:Mirror --progress --transfers 8`\n"
+            "`/rclone move terabox:Mirror/file.zip gdrive:Backup/`",
+        )
+        return
+
+    command = [RCLONE_BIN, *args]
+    command_preview = " ".join(shlex.quote(item) for item in command)
+    status_message = await open_status_message(
+        message,
+        "Menjalankan rclone...\n"
+        f"Timeout: `{format_duration(RCLONE_COMMAND_TIMEOUT_SECONDS)}`\n"
+        f"Command: `{trim_output(command_preview)}`",
+    )
+
+    started_at = time.time()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        await update_status_message(
+            message,
+            status_message,
+            f"Binary rclone tidak ditemukan.\nSet env `RCLONE_BIN` (saat ini: `{RCLONE_BIN}`).",
+        )
+        return
+    except Exception as e:
+        await update_status_message(
+            message,
+            status_message,
+            f"Gagal menjalankan rclone: `{e}`",
+        )
+        return
+
+    timed_out = False
+    try:
+        stdout_raw, stderr_raw = await asyncio.wait_for(
+            process.communicate(),
+            timeout=RCLONE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        process.kill()
+        stdout_raw, stderr_raw = await process.communicate()
+
+    stdout_text = stdout_raw.decode("utf-8", errors="ignore").strip()
+    stderr_text = stderr_raw.decode("utf-8", errors="ignore").strip()
+    elapsed_text = format_duration(int(max(0, time.time() - started_at)))
+
+    def tail_text(text: str, max_lines: int = 50, max_chars: int = 2000) -> str:
+        lines = text.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        merged = "\n".join(lines).strip()
+        if len(merged) > max_chars:
+            merged = merged[-max_chars:]
+        return merged
+
+    result_lines = [
+        "rclone selesai." if not timed_out else "rclone dihentikan karena timeout.",
+        f"Durasi: `{elapsed_text}`",
+        f"Command: `{trim_output(command_preview)}`",
+        f"Return code: `{process.returncode}`",
+    ]
+    if timed_out:
+        result_lines.append(
+            f"Status: timeout setelah `{format_duration(RCLONE_COMMAND_TIMEOUT_SECONDS)}`."
+        )
+    elif process.returncode == 0:
+        result_lines.append("Status: berhasil.")
+    else:
+        result_lines.append("Status: gagal.")
+
+    stderr_tail = tail_text(stderr_text)
+    stdout_tail = tail_text(stdout_text)
+    if stderr_tail:
+        result_lines.extend(["", "stderr:", "```text", stderr_tail, "```"])
+    if stdout_tail:
+        result_lines.extend(["", "stdout:", "```text", stdout_tail, "```"])
+
+    await update_status_message(message, status_message, trim_output("\n".join(result_lines)))
+
+
 @app.on_message(command_filter("ucancel"))
 async def cancel_upload_command(client: Client, message):
     del client
@@ -3488,17 +3750,24 @@ async def cancel_upload_command(client: Client, message):
 async def list_command(client: Client, message):
     del client
 
-    if not await require_private_command_access(message, "ls"):
+    if not await require_owner_or_whitelist_access(message, "ls"):
         return
 
     args = command_args(message)
     show_all = False
+    options_ended = False
     path_parts = []
     for arg in args:
-        if arg == "-a":
-            show_all = True
-        else:
-            path_parts.append(arg)
+        if not options_ended and arg == "--":
+            options_ended = True
+            continue
+        if not options_ended and arg.startswith("-"):
+            normalized = arg.lower()
+            if normalized == "--all" or "a" in normalized.lstrip("-"):
+                show_all = True
+            # Opsi lain diabaikan agar kompatibel dengan gaya shell (/ls -lh, dll).
+            continue
+        path_parts.append(arg)
 
     path_text = " ".join(path_parts).strip() or "."
     try:
@@ -3558,7 +3827,7 @@ async def list_command(client: Client, message):
 async def disk_usage_command(client: Client, message):
     del client
 
-    if not await require_public_command_access(message, "du"):
+    if not await require_owner_or_whitelist_access(message, "du"):
         return
 
     args = command_args(message)
@@ -3596,7 +3865,7 @@ async def disk_usage_command(client: Client, message):
 async def disk_free_command(client: Client, message):
     del client
 
-    if not await require_public_command_access(message, "df"):
+    if not await require_owner_or_whitelist_access(message, "df"):
         return
 
     args = command_args(message)
@@ -3712,17 +3981,29 @@ async def mkdir_command(client: Client, message):
 async def remove_command(client: Client, message):
     del client
 
-    if not await require_private_command_access(message, "rm"):
+    if not await require_owner_or_whitelist_access(message, "rm"):
         return
 
-    args = command_args(message)
+    raw_args = command_args(message)
+    options_ended = False
+    args = []
+    for arg in raw_args:
+        if not options_ended and arg == "--":
+            options_ended = True
+            continue
+        if not options_ended and arg.startswith("-"):
+            # Kompatibilitas: terima opsi seperti -r/-f/-rf, lalu abaikan.
+            continue
+        args.append(arg)
+
     if not args:
         await open_status_message(
             message,
             "Format:\n"
             "`/rm /home/runner/uploads/file.txt`\n"
             "`/rm /home/runner/uploads/tmp-folder`\n"
-            "`/rm *.tmp`"
+            "`/rm *.tmp`\n"
+            "Catatan: opsi seperti `-rf` boleh dipakai untuk kompatibilitas."
         )
         return
 
@@ -3786,11 +4067,11 @@ async def remove_command(client: Client, message):
     await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
-@app.on_message(command_filter("copy"))
+@app.on_message(command_filter(["copy", "cp"]))
 async def copy_command(client: Client, message):
     del client
 
-    if not await require_private_command_access(message, "copy"):
+    if not await require_owner_or_whitelist_access(message, "copy"):
         return
 
     args = command_args(message)
@@ -3799,6 +4080,7 @@ async def copy_command(client: Client, message):
             message,
             "Format:\n"
             "`/copy /home/runner/uploads/a.txt /home/runner/backup/a.txt`\n"
+            "`/cp /home/runner/uploads/a.txt /home/runner/backup/a.txt`\n"
             "`/copy *.mp4 /home/runner/backup/videos/`\n"
             "Catatan: gunakan tanda kutip jika path mengandung spasi."
         )
@@ -3884,7 +4166,7 @@ async def copy_command(client: Client, message):
 async def move_command(client: Client, message):
     del client
 
-    if not await require_private_command_access(message, "mv"):
+    if not await require_owner_or_whitelist_access(message, "mv"):
         return
 
     args = command_args(message)
@@ -3983,21 +4265,21 @@ if __name__ == "__main__":
     print(f"Mode command: {'PUBLIC' if PUBLIC_MODE else 'PRIVATE'}")
     print("Langkah pakai:")
     if BOT_MODE and PUBLIC_MODE:
-        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /du /df /aria2 (/a2) /gdl (/gallerydl) /u1.")
+        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /ps /aria2 (/a2) /gdl (/gallerydl) /u1.")
         print("2. Untuk /d1: reply file/video/link t.me + /d1, atau langsung /d1 <link t.me>.")
         print("3. Cek antrian download: /dstatus atau /dqueue.")
-        print("4. Khusus admin whitelist (`PKILL_ADMIN_IDS`): /pkill.")
-        print("5. Khusus owner bot (OWNER_USER_ID): /ucancel /ls /mkdir /rm /copy /mv.")
+        print("4. Khusus whitelist/owner (`PKILL_ADMIN_IDS` atau OWNER_USER_ID): /pkill /rclone /ls /rm /du /df /copy (/cp) /mv.")
+        print("5. Khusus owner bot (OWNER_USER_ID): /ucancel /mkdir.")
     elif BOT_MODE:
         print("1. Command private tetap hanya owner (OWNER_USER_ID).")
-        print("2. /pkill khusus user ID yang ada di whitelist `PKILL_ADMIN_IDS`.")
-        print("3. Public command nonaktif. Aktifkan PUBLIC_MODE=1 untuk membuka /d1 /dstatus /dqueue /du /df /aria2 /gdl /u1.")
+        print("2. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv untuk user whitelist `PKILL_ADMIN_IDS` (owner juga bisa).")
+        print("3. Public command nonaktif. Aktifkan PUBLIC_MODE=1 untuk membuka /d1 /dstatus /dqueue /ps /aria2 /gdl /u1.")
     elif PUBLIC_MODE:
-        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /du /df /aria2 (/a2) /gdl (/gallerydl) /u1.")
+        print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /ps /aria2 (/a2) /gdl (/gallerydl) /u1.")
         print("2. Untuk /d1: reply file/video/link t.me + /d1, atau langsung /d1 <link t.me>.")
         print("3. Cek antrian download: /dstatus atau /dqueue.")
-        print("4. /pkill hanya bisa dipakai user ID yang ada di whitelist `PKILL_ADMIN_IDS`.")
-        print("5. Command owner (Saved Messages): /ucancel /ls /mkdir /rm /copy /mv.")
+        print("4. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv hanya untuk whitelist `PKILL_ADMIN_IDS` (atau owner).")
+        print("5. Command owner (Saved Messages): /ucancel /mkdir.")
     else:
         print("1. Forward file/video ATAU kirim link t.me ke Saved Messages.")
         print("2. Reply pesan tersebut dengan /d1, atau kirim /d1 <link t.me>.")
@@ -4015,14 +4297,18 @@ if __name__ == "__main__":
         f"- Remote rclone: GDrive=`{RCLONE_GDRIVE_REMOTE or '(belum diatur)'}`, "
         f"Terabox=`{RCLONE_TERABOX_REMOTE or '(belum diatur)'}`"
     )
-    print("- Cek isi direktori: /ls /path  (opsional: /ls -a /path)")
-    print("- Cek disk: /du [-h] [path] dan /df [-h] [path]")
+    print("- Cek isi direktori: /ls [opsi] [path] (mis. /ls -lh /path, /ls --all /path) [whitelist/owner]")
+    print("- Cek disk: /du [opsi] [path] dan /df [opsi] [path] (opsi diterima utk kompatibilitas) [whitelist/owner]")
     print("- Batalkan upload yang sedang berjalan: /ucancel")
+    print("- Cek proses: /ps <nama_proses|pid>  (public jika PUBLIC_MODE=1, contoh: /ps aria2)")
     print("- Admin whitelist: /pkill <pattern> (opsional signal: /pkill --signal TERM <pattern>)")
+    print("- Admin whitelist: /rclone <subcommand> [opsi] (opsi fleksibel, contoh: /rclone ls remote:)")
     print(
         f"- PKILL_ADMIN_IDS: `{', '.join(str(item) for item in sorted(PKILL_ADMIN_USER_IDS)) or '(kosong)'}`"
     )
-    print("- Manajemen file: /mkdir <path>, /rm <path>, /copy <source> <target>, /mv <source> <target>")
+    print("- Manajemen file: /mkdir <path> (owner)")
+    print("- Copy/move: /copy|/cp <source> <target>, /mv <source> <target> [whitelist/owner]")
+    print("- Hapus file/folder: /rm [opsi] <path> (mis. /rm -rf /path) [whitelist/owner]")
     print(f"- File download disimpan ke: {download_root}")
     print(f"- Default folder upload: {upload_root}")
     app.run()
