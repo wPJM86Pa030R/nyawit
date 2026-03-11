@@ -16,7 +16,9 @@ jobs:
       API_HASH: ${{ secrets.API_HASH }}
       SESSION_STRING: ${{ secrets.SESSION_STRING }}
       DOWNLOAD_DIR: ${{ secrets.DOWNLOAD_DIR }}
+      UPLOAD_DIR: ${{ secrets.UPLOAD_DIR }}
       PROGRESS_INTERVAL: ${{ secrets.PROGRESS_INTERVAL }}
+      ARIA2_BUTTON_TTL_SECONDS: ${{ secrets.ARIA2_BUTTON_TTL_SECONDS }}
       RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
       RCLONE_REMOTE_PATH: ${{ secrets.RCLONE_REMOTE_PATH }}
       RCLONE_GDRIVE_REMOTE: ${{ secrets.RCLONE_GDRIVE_REMOTE }}
@@ -27,6 +29,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       OWNER_USER_ID: ${{ secrets.OWNER_USER_ID }}
+      PKILL_ADMIN_IDS: ${{ secrets.PKILL_ADMIN_IDS }}
       TELE_GRUP: ${{ secrets.TELE_GRUP }}
       PUBLIC_MODE: "1"
 
