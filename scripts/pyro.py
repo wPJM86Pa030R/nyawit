@@ -2099,83 +2099,6 @@ async def download_queue_worker(client: Client):
                     DOWNLOAD_CONTROL["current"] = None
 
 
-async def handle_d1_preselected_queue_request(
-    client: Client,
-    command_message,
-    status_message,
-    target_message,
-    media_name: str,
-    preselect_token: str,
-) -> None:
-    try:
-        selected_action = ""
-        wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
-        while time.time() < wait_deadline:
-            pending_payload = ARIA2_PENDING_UPLOAD_CHOICES.get(preselect_token)
-            if not pending_payload:
-                await update_status_message(
-                    command_message,
-                    status_message,
-                    "Sesi pilihan upload tidak ditemukan atau sudah kedaluwarsa.",
-                    reply_markup=None,
-                )
-                return
-
-            selected_action = str(pending_payload.get("selected_action") or "").strip()
-            if selected_action in {"tg", "gd", "tb", "skip"}:
-                break
-            await asyncio.sleep(0.5)
-        else:
-            ARIA2_PENDING_UPLOAD_CHOICES.pop(preselect_token, None)
-            await update_status_message(
-                command_message,
-                status_message,
-                "Waktu memilih tujuan upload habis. Jalankan `/d1` lagi.",
-                reply_markup=None,
-            )
-            return
-
-        ARIA2_PENDING_UPLOAD_CHOICES.pop(preselect_token, None)
-        action_label = {
-            "tg": "Telegram",
-            "gd": "rclone Google Drive",
-            "tb": "rclone Terabox",
-            "skip": "Lewati upload",
-        }.get(selected_action, selected_action)
-        request_id, queue_position, overall_position = await enqueue_download_request(
-            client=client,
-            command_message=command_message,
-            status_message=status_message,
-            target_message=target_message,
-            media_name=media_name,
-            enable_upload_buttons=True,
-            selected_upload_action=selected_action,
-            upload_token=preselect_token,
-        )
-
-        await update_status_message(
-            command_message,
-            status_message,
-            "Pilihan upload sudah disimpan.\n"
-            f"Tujuan: `{action_label}`\n\n"
-            "Permintaan download masuk antrian.\n"
-            f"ID: `#{request_id}`\n"
-            f"File: {media_name}\n"
-            f"Posisi antrian: `{queue_position}`\n"
-            f"Posisi total (termasuk yang aktif): `{overall_position}`\n"
-            "Gunakan `/dstatus` untuk lihat detail.",
-            reply_markup=None,
-        )
-    except Exception as e:
-        ARIA2_PENDING_UPLOAD_CHOICES.pop(preselect_token, None)
-        await update_status_message(
-            command_message,
-            status_message,
-            f"Gagal memproses sesi /d1 setelah pilihan upload: `{e}`",
-            reply_markup=None,
-        )
-
-
 def local_path_from_text(path_text: str) -> Path:
     raw = path_text.strip()
     if raw.startswith("file://"):
@@ -2721,16 +2644,22 @@ async def download_command(client: Client, message):
         f"Sumber: `{name}`",
         reply_markup=preselect_markup,
     )
-    asyncio.create_task(
-        handle_d1_preselected_queue_request(
-            client=client,
-            command_message=message,
-            status_message=status_message,
-            target_message=target_message,
-            media_name=name,
-            preselect_token=preselect_token,
+    pending_payload = ARIA2_PENDING_UPLOAD_CHOICES.get(preselect_token)
+    if not pending_payload:
+        await update_status_message(
+            message,
+            status_message,
+            "Sesi pilihan upload /d1 tidak ditemukan.",
+            reply_markup=None,
         )
-    )
+        return
+
+    # Model /d1 dibuat callback-driven seperti /u1:
+    # setelah tombol dipilih, callback akan enqueue download.
+    pending_payload["command_message"] = message
+    pending_payload["status_message"] = status_message
+    pending_payload["target_message"] = target_message
+    pending_payload["media_name"] = name
 
 
 @app.on_message(command_filter(["dstatus", "dqueue"], allow_public=True))
@@ -3460,13 +3389,75 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             await callback_query.answer("Aksi tombol tidak dikenal.", show_alert=True)
             return
 
+        if source_label == "d1":
+            command_message = pending_payload.get("command_message")
+            queued_status_message = pending_payload.get("status_message") or status_message
+            target_message = pending_payload.get("target_message")
+            media_name = str(pending_payload.get("media_name") or "").strip() or "unknown"
+
+            if not command_message or not target_message:
+                ARIA2_PENDING_UPLOAD_CHOICES.pop(token, None)
+                await callback_query.answer(
+                    "Sesi /d1 tidak valid atau sudah kedaluwarsa.",
+                    show_alert=True,
+                )
+                await update_status_message(
+                    status_message,
+                    status_message,
+                    "Sesi /d1 tidak valid atau sudah kedaluwarsa. Jalankan `/d1` lagi.",
+                    reply_markup=None,
+                )
+                return
+
+            ARIA2_PENDING_UPLOAD_CHOICES.pop(token, None)
+            action_label = {
+                "tg": "Telegram",
+                "gd": "rclone Google Drive",
+                "tb": "rclone Terabox",
+                "skip": "Lewati upload",
+            }.get(action, action)
+            try:
+                request_id, queue_position, overall_position = await enqueue_download_request(
+                    client=client,
+                    command_message=command_message,
+                    status_message=queued_status_message,
+                    target_message=target_message,
+                    media_name=media_name,
+                    enable_upload_buttons=True,
+                    selected_upload_action=action,
+                    upload_token=token,
+                )
+            except Exception as e:
+                await callback_query.answer("Gagal memasukkan /d1 ke antrian.", show_alert=True)
+                await update_status_message(
+                    command_message,
+                    queued_status_message,
+                    f"Gagal memasukkan /d1 ke antrian: `{e}`",
+                    reply_markup=None,
+                )
+                return
+
+            await callback_query.answer(
+                f"Pilihan disimpan: {action_label}. Download masuk antrian sekarang."
+            )
+            await update_status_message(
+                command_message,
+                queued_status_message,
+                "Pilihan upload sudah disimpan.\n"
+                f"Tujuan: `{action_label}`\n\n"
+                "Permintaan download masuk antrian.\n"
+                f"ID: `#{request_id}`\n"
+                f"File: {media_name}\n"
+                f"Posisi antrian: `{queue_position}`\n"
+                f"Posisi total (termasuk yang aktif): `{overall_position}`\n"
+                "Gunakan `/dstatus` untuk lihat detail.",
+                reply_markup=None,
+            )
+            return
+
         pending_payload["selected_action"] = action
         pending_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
-        start_text = (
-            "Download masuk antrian sekarang."
-            if source_label == "d1"
-            else "Download dimulai sekarang."
-        )
+        start_text = "Download dimulai sekarang."
         if action == "skip":
             await callback_query.answer(
                 f"Pilihan disimpan: upload lanjutan akan dilewati. {start_text}"
