@@ -28,7 +28,7 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/downloads")
 RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
 RCLONE_GDRIVE_REMOTE = os.getenv("RCLONE_GDRIVE_REMOTE", "").strip()
-RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "terabox:Mirror").strip()
+RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "").strip()
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "1",
