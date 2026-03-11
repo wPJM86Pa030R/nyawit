@@ -834,6 +834,7 @@ def normalize_existing_file_paths(paths: List[Path]) -> List[Path]:
 
 def register_aria2_upload_job(
     requester_id: Optional[int],
+    requester_name: str,
     chat_id: int,
     files: List[Path],
     target_dir: Optional[Path] = None,
@@ -861,6 +862,7 @@ def register_aria2_upload_job(
 
     ARIA2_UPLOAD_JOBS[resolved_token] = {
         "requester_id": requester_id,
+        "requester_name": requester_name.strip(),
         "chat_id": chat_id,
         "files": [str(path) for path in valid_files],
         "target_dir": base_dir_text,
@@ -1188,9 +1190,21 @@ def build_upload_summary(
     return trim_output("\n".join(summary_lines))
 
 
-def mention_user_by_id(user_id: Optional[int]) -> str:
+def sanitize_mention_name(raw_name: str) -> str:
+    cleaned = (raw_name or "").replace("\r", " ").replace("\n", " ").strip()
+    if not cleaned:
+        return "user"
+    # Hindari karakter yang bisa memutus format markdown mention.
+    cleaned = cleaned.replace("[", "").replace("]", "").replace("`", "")
+    return cleaned[:64]
+
+
+def mention_user_by_id(user_id: Optional[int], display_name: Optional[str] = None) -> str:
     if isinstance(user_id, int):
-        return f"[user](tg://user?id={user_id})"
+        label = sanitize_mention_name(display_name or "user")
+        return f"[{label}](tg://user?id={user_id})"
+    if display_name:
+        return f"`{sanitize_mention_name(display_name)}`"
     return "`unknown`"
 
 
@@ -1199,6 +1213,7 @@ async def send_upload_result_notification(
     source_title: str,
     destination_text: str,
     executor_user_id: Optional[int],
+    executor_display_name: Optional[str],
     success_count: int,
     failed_count: int,
     cancelled: bool = False,
@@ -1217,7 +1232,7 @@ async def send_upload_result_notification(
         f"Sumber: `{source_title}`",
         f"Tujuan: `{destination_text}`",
         f"Hasil: `{result_text}` (berhasil `{success_count}`, gagal `{failed_count}`)",
-        f"Eksekutor: {mention_user_by_id(executor_user_id)}",
+        f"Eksekutor: {mention_user_by_id(executor_user_id, executor_display_name)}",
     ]
     try:
         await status_message.reply_text(trim_output("\n".join(lines)), disable_web_page_preview=True)
@@ -1457,6 +1472,11 @@ async def execute_upload_action_for_token(
             else None
         )
     )
+    executor_display_name = (
+        telegram_user_display_name(actor)
+        if actor
+        else str(job_payload.get("requester_name") or "").strip()
+    )
 
     if not source_paths:
         ARIA2_UPLOAD_JOBS.pop(token, None)
@@ -1557,6 +1577,7 @@ async def execute_upload_action_for_token(
                 source_title=source_title,
                 destination_text=target,
                 executor_user_id=executor_user_id,
+                executor_display_name=executor_display_name,
                 success_count=len(success_lines),
                 failed_count=len(failed_lines),
                 cancelled=cancelled,
@@ -1642,6 +1663,7 @@ async def execute_upload_action_for_token(
             source_title=source_title,
             destination_text=remote_base,
             executor_user_id=executor_user_id,
+            executor_display_name=executor_display_name,
             success_count=len(success_lines),
             failed_count=len(failed_lines),
             cancelled=False,
@@ -1651,6 +1673,23 @@ async def execute_upload_action_for_token(
     if callback_query:
         await callback_query.answer("Aksi tombol tidak dikenal.", show_alert=True)
     return status_message, False
+
+
+def telegram_user_display_name(user) -> str:
+    if not user:
+        return ""
+    full_name = " ".join(
+        part.strip()
+        for part in [getattr(user, "first_name", ""), getattr(user, "last_name", "")]
+        if part and str(part).strip()
+    ).strip()
+    if full_name:
+        return full_name
+    username = str(getattr(user, "username", "") or "").strip()
+    if username:
+        return username
+    user_id = getattr(user, "id", None)
+    return str(user_id) if isinstance(user_id, int) else ""
 
 
 def requester_label(message) -> str:
@@ -1970,6 +2009,9 @@ async def download_queue_worker(client: Client):
                     selected_upload_action = str(item.get("selected_upload_action") or "").strip()
                     token = register_aria2_upload_job(
                         requester_id=getattr(command_message.from_user, "id", None),
+                        requester_name=telegram_user_display_name(
+                            getattr(command_message, "from_user", None)
+                        ),
                         chat_id=item.get("chat_id", command_message.chat.id),
                         files=[downloaded_path],
                         target_dir=downloaded_path.parent,
@@ -2973,6 +3015,7 @@ async def aria2_download_command(client: Client, message):
         if downloaded_files:
             token = register_aria2_upload_job(
                 requester_id=getattr(message.from_user, "id", None),
+                requester_name=telegram_user_display_name(getattr(message, "from_user", None)),
                 chat_id=message.chat.id,
                 files=downloaded_files,
                 target_dir=target_dir,
@@ -3253,6 +3296,7 @@ async def gallery_dl_download_command(client: Client, message):
         if downloaded_files:
             token = register_aria2_upload_job(
                 requester_id=getattr(message.from_user, "id", None),
+                requester_name=telegram_user_display_name(getattr(message, "from_user", None)),
                 chat_id=message.chat.id,
                 files=downloaded_files,
                 target_dir=target_dir,
@@ -3652,6 +3696,7 @@ async def u1_file_pick_callback(client: Client, callback_query):
     target_chat = session_payload.get("target_chat", status_message.chat.id)
     upload_token = register_aria2_upload_job(
         requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+        requester_name=telegram_user_display_name(actor),
         chat_id=target_chat,
         files=[selected_path],
         target_dir=selected_path.parent,
