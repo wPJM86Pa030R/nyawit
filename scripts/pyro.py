@@ -486,10 +486,15 @@ def parse_gallery_dl_command_args(
     args: List[str],
     fallback_urls: Optional[List[str]] = None,
 ) -> Tuple[Optional[List[str]], Optional[Path], Optional[List[str]], Optional[str]]:
+    def is_directory_option(option_text: str) -> bool:
+        key, _, _ = option_text.partition("=")
+        return key.strip().lower() == "directory"
+
     command_args: List[str] = []
     urls: List[str] = []
     target_dir: Path = download_root
     dest_explicit = False
+    directory_option_explicit = False
 
     i = 0
     while i < len(args):
@@ -518,6 +523,23 @@ def parse_gallery_dl_command_args(
                 return None, None, None, f"Path --dest tidak valid: `{e}`"
             command_args.append(f"--dest={target_dir}")
             dest_explicit = True
+        elif arg in {"-o", "--option"}:
+            i += 1
+            if i >= len(args):
+                return None, None, None, "Nilai -o/--option tidak boleh kosong."
+            option_text = args[i].strip()
+            if not option_text:
+                return None, None, None, "Nilai -o/--option tidak boleh kosong."
+            if is_directory_option(option_text):
+                directory_option_explicit = True
+            command_args.extend([arg, option_text])
+        elif arg.startswith("--option="):
+            option_text = arg.split("=", 1)[1].strip()
+            if not option_text:
+                return None, None, None, "Nilai --option tidak boleh kosong."
+            if is_directory_option(option_text):
+                directory_option_explicit = True
+            command_args.append(arg)
         else:
             command_args.append(arg)
             if is_direct_url(arg):
@@ -535,16 +557,21 @@ def parse_gallery_dl_command_args(
             urls.append(cleaned)
             command_args.append(cleaned)
 
-    if not dest_explicit:
+    if not dest_explicit and not directory_option_explicit:
+        command_args = ["-d", str(target_dir), "-o", 'directory=""', *command_args]
+    elif not dest_explicit:
         command_args = ["-d", str(target_dir), *command_args]
+    elif not directory_option_explicit:
+        command_args = ["-o", 'directory=""', *command_args]
 
     if not urls:
         return None, None, None, (
             "Format gallery-dl:\n"
             "`/gdl <url>`\n"
             "`/gdl -d /home/runner/downloads <url>`\n"
-            "`/gdl -o directory='' <url>`\n"
+            "`/gdl -o directory=\"\" <url>`\n"
             "`/gdl` sambil reply link direct (http/https/ftp)\n"
+            "Default otomatis: `-d /home/runner/downloads -o directory=\"\"`\n"
             "Alias kompatibilitas: `/gallerydl`"
         )
 
@@ -4516,7 +4543,8 @@ if __name__ == "__main__":
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
     print("- Di /aria2, wajib pilih tujuan upload dulu; download baru dimulai setelah pilihan dibuat.")
     print("- Di /gdl, wajib pilih tujuan upload dulu; download baru dimulai setelah pilihan dibuat.")
-    print("- Download via gallery-dl (contoh GoFile): /gdl -d /path/target -o directory='' https://gofile.io/d/xxxxx")
+    print("- Download via gallery-dl (contoh GoFile): /gdl https://gofile.io/d/xxxxx  (default: -d /home/runner/downloads -o directory=\"\")")
+    print("- Override manual tetap bisa: /gdl -d /path/target -o directory=\"\" https://gofile.io/d/xxxxx")
     print("- /aria2 dan /gdl juga bisa dipakai sambil reply link direct (http/https/ftp)")
     print("- Di /u1, bot menampilkan daftar file + tombol angka; pilih satu file dulu sebelum tombol upload tampil.")
     print("- Setelah /d1, /aria2, atau /gdl selesai, bot menampilkan tombol upload: Telegram / rclone GDrive / rclone Terabox")
