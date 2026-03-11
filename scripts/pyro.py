@@ -1188,6 +1188,43 @@ def build_upload_summary(
     return trim_output("\n".join(summary_lines))
 
 
+def mention_user_by_id(user_id: Optional[int]) -> str:
+    if isinstance(user_id, int):
+        return f"[user](tg://user?id={user_id})"
+    return "`unknown`"
+
+
+async def send_upload_result_notification(
+    status_message,
+    source_title: str,
+    destination_text: str,
+    executor_user_id: Optional[int],
+    success_count: int,
+    failed_count: int,
+    cancelled: bool = False,
+) -> None:
+    if cancelled:
+        result_text = "dibatalkan"
+    elif failed_count <= 0:
+        result_text = "sukses"
+    elif success_count > 0:
+        result_text = "gagal sebagian"
+    else:
+        result_text = "gagal"
+
+    lines = [
+        "Notifikasi upload:",
+        f"Sumber: `{source_title}`",
+        f"Tujuan: `{destination_text}`",
+        f"Hasil: `{result_text}` (berhasil `{success_count}`, gagal `{failed_count}`)",
+        f"Eksekutor: {mention_user_by_id(executor_user_id)}",
+    ]
+    try:
+        await status_message.reply_text(trim_output("\n".join(lines)), disable_web_page_preview=True)
+    except Exception:
+        pass
+
+
 def build_rclone_destination(remote_base: str, file_name: str) -> str:
     base = remote_base.strip()
     if base.endswith(":") or base.endswith("/"):
@@ -1410,6 +1447,16 @@ async def execute_upload_action_for_token(
 
     source_label = str(job_payload.get("source_label") or "aria2").strip() or "aria2"
     source_title = source_label
+    actor = getattr(callback_query, "from_user", None) if callback_query else None
+    executor_user_id = (
+        actor.id
+        if actor and isinstance(getattr(actor, "id", None), int)
+        else (
+            job_payload.get("requester_id")
+            if isinstance(job_payload.get("requester_id"), int)
+            else None
+        )
+    )
 
     if not source_paths:
         ARIA2_UPLOAD_JOBS.pop(token, None)
@@ -1505,6 +1552,15 @@ async def execute_upload_action_for_token(
                 summary_text,
                 reply_markup=reply_markup,
             )
+            await send_upload_result_notification(
+                status_message=status_message,
+                source_title=source_title,
+                destination_text=target,
+                executor_user_id=executor_user_id,
+                success_count=len(success_lines),
+                failed_count=len(failed_lines),
+                cancelled=cancelled,
+            )
         finally:
             current_task = asyncio.current_task()
             if UPLOAD_CONTROL.get("task") is current_task:
@@ -1580,6 +1636,15 @@ async def execute_upload_action_for_token(
             status_message,
             summary_text,
             reply_markup=reply_markup,
+        )
+        await send_upload_result_notification(
+            status_message=status_message,
+            source_title=source_title,
+            destination_text=remote_base,
+            executor_user_id=executor_user_id,
+            success_count=len(success_lines),
+            failed_count=len(failed_lines),
+            cancelled=False,
         )
         return status_message, True
 
@@ -1761,6 +1826,8 @@ async def enqueue_download_request(
     target_message,
     media_name: str,
     enable_upload_buttons: bool = False,
+    selected_upload_action: str = "",
+    upload_token: Optional[str] = None,
 ) -> Tuple[int, int, int]:
     now = time.time()
     async with DOWNLOAD_CONTROL["lock"]:
@@ -1776,6 +1843,8 @@ async def enqueue_download_request(
             "requester": requester_label(command_message),
             "chat_id": command_message.chat.id,
             "enable_upload_buttons": bool(enable_upload_buttons),
+            "selected_upload_action": selected_upload_action.strip(),
+            "upload_token": upload_token.strip() if isinstance(upload_token, str) else None,
         }
         DOWNLOAD_CONTROL["queue"].append(queue_item)
         queue_position = len(DOWNLOAD_CONTROL["queue"])
@@ -1898,24 +1967,61 @@ async def download_queue_worker(client: Client):
                     downloaded_path = Path(str(file_path))
 
                 if item.get("enable_upload_buttons"):
+                    selected_upload_action = str(item.get("selected_upload_action") or "").strip()
                     token = register_aria2_upload_job(
                         requester_id=getattr(command_message.from_user, "id", None),
                         chat_id=item.get("chat_id", command_message.chat.id),
                         files=[downloaded_path],
                         target_dir=downloaded_path.parent,
                         source_label="d1",
+                        token=item.get("upload_token"),
                     )
                     if token:
-                        status_message = await update_status_message(
-                            command_message,
-                            status_message,
-                            "Download selesai.\n"
-                            f"ID: `#{request_id}`\n"
-                            f"Lokasi: `{downloaded_path}`\n\n"
-                            "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox.\n"
+                        summary_lines = [
+                            "Download selesai.",
+                            f"ID: `#{request_id}`",
+                            f"Lokasi: `{downloaded_path}`",
+                            "",
                             f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
-                            reply_markup=build_aria2_upload_keyboard(token),
-                        )
+                        ]
+                        if selected_upload_action in {"tg", "gd", "tb"}:
+                            summary_lines.append("")
+                            summary_lines.append(
+                                f"Pilihan upload otomatis: `{selected_upload_action}`. Upload akan langsung dijalankan."
+                            )
+                            status_message = await update_status_message(
+                                command_message,
+                                status_message,
+                                trim_output("\n".join(summary_lines)),
+                                reply_markup=None,
+                            )
+                            status_message, _ = await execute_upload_action_for_token(
+                                client=client,
+                                status_message=status_message,
+                                token=token,
+                                action=selected_upload_action,
+                                source_paths=[downloaded_path],
+                            )
+                        elif selected_upload_action == "skip":
+                            summary_lines.append("")
+                            summary_lines.append("Upload lanjutan: dilewati (dipilih sebelumnya).")
+                            status_message = await update_status_message(
+                                command_message,
+                                status_message,
+                                trim_output("\n".join(summary_lines)),
+                                reply_markup=None,
+                            )
+                            ARIA2_UPLOAD_JOBS.pop(token, None)
+                        else:
+                            summary_lines.append(
+                                "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox."
+                            )
+                            status_message = await update_status_message(
+                                command_message,
+                                status_message,
+                                trim_output("\n".join(summary_lines)),
+                                reply_markup=build_aria2_upload_keyboard(token),
+                            )
                     else:
                         status_message = await update_status_message(
                             command_message,
@@ -2448,7 +2554,7 @@ async def resolve_target_message_from_link_text(client: Client, source_text: str
     return target_message, None
 
 
-# Manual only, no auto-download.
+# Manual command for Telegram media/link download.
 @app.on_message(command_filter("d1", allow_public=True))
 async def download_command(client: Client, message):
     if not await require_public_command_access(message, "d1"):
@@ -2480,6 +2586,57 @@ async def download_command(client: Client, message):
         return
 
     name = media_label(target_message)
+    preselect_token = register_pending_upload_choice(
+        requester_id=getattr(message.from_user, "id", None),
+        chat_id=message.chat.id,
+        source_label="d1",
+    )
+    preselect_markup = build_aria2_upload_keyboard(preselect_token)
+
+    status_message = await update_status_message(
+        message,
+        status_message,
+        "Permintaan /d1 diterima.\n"
+        "Pilih tujuan upload dulu lewat tombol di bawah.\n"
+        "Download baru akan masuk antrian setelah kamu memilih.\n\n"
+        f"Sumber: `{name}`",
+        reply_markup=preselect_markup,
+    )
+
+    selected_action = ""
+    wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
+    while time.time() < wait_deadline:
+        pending_payload = ARIA2_PENDING_UPLOAD_CHOICES.get(preselect_token)
+        if not pending_payload:
+            await update_status_message(
+                message,
+                status_message,
+                "Sesi pilihan upload tidak ditemukan atau sudah kedaluwarsa.",
+                reply_markup=None,
+            )
+            return
+
+        selected_action = str(pending_payload.get("selected_action") or "").strip()
+        if selected_action in {"tg", "gd", "tb", "skip"}:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        ARIA2_PENDING_UPLOAD_CHOICES.pop(preselect_token, None)
+        await update_status_message(
+            message,
+            status_message,
+            "Waktu memilih tujuan upload habis. Jalankan `/d1` lagi.",
+            reply_markup=None,
+        )
+        return
+
+    ARIA2_PENDING_UPLOAD_CHOICES.pop(preselect_token, None)
+    action_label = {
+        "tg": "Telegram",
+        "gd": "rclone Google Drive",
+        "tb": "rclone Terabox",
+        "skip": "Lewati upload",
+    }.get(selected_action, selected_action)
     request_id, queue_position, overall_position = await enqueue_download_request(
         client=client,
         command_message=message,
@@ -2487,11 +2644,15 @@ async def download_command(client: Client, message):
         target_message=target_message,
         media_name=name,
         enable_upload_buttons=True,
+        selected_upload_action=selected_action,
+        upload_token=preselect_token,
     )
 
     await update_status_message(
         message,
         status_message,
+        "Pilihan upload sudah disimpan.\n"
+        f"Tujuan: `{action_label}`\n\n"
         "Permintaan download masuk antrian.\n"
         f"ID: `#{request_id}`\n"
         f"File: {name}\n"
@@ -3228,9 +3389,14 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
 
         pending_payload["selected_action"] = action
         pending_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+        start_text = (
+            "Download masuk antrian sekarang."
+            if source_label == "d1"
+            else "Download dimulai sekarang."
+        )
         if action == "skip":
             await callback_query.answer(
-                "Pilihan disimpan: upload lanjutan akan dilewati. Download dimulai sekarang."
+                f"Pilihan disimpan: upload lanjutan akan dilewati. {start_text}"
             )
             return
 
@@ -3240,7 +3406,7 @@ async def aria2_upload_choice_callback(client: Client, callback_query):
             "tb": "rclone Terabox",
         }.get(action, action)
         await callback_query.answer(
-            f"Pilihan disimpan: {action_label}. Download dimulai sekarang."
+            f"Pilihan disimpan: {action_label}. {start_text}"
         )
         return
 
@@ -4541,13 +4707,14 @@ if __name__ == "__main__":
         print("3. Cek antrian download: /dstatus atau /dqueue.")
         print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, atau /u1 /path/*.mp4 --to @username")
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
+    print("- Di /d1, wajib pilih tujuan upload dulu; request akan masuk antrian setelah pilihan dibuat.")
     print("- Di /aria2, wajib pilih tujuan upload dulu; download baru dimulai setelah pilihan dibuat.")
     print("- Di /gdl, wajib pilih tujuan upload dulu; download baru dimulai setelah pilihan dibuat.")
     print("- Download via gallery-dl (contoh GoFile): /gdl https://gofile.io/d/xxxxx  (default: -d /home/runner/downloads -o directory=\"\")")
     print("- Override manual tetap bisa: /gdl -d /path/target -o directory=\"\" https://gofile.io/d/xxxxx")
     print("- /aria2 dan /gdl juga bisa dipakai sambil reply link direct (http/https/ftp)")
     print("- Di /u1, bot menampilkan daftar file + tombol angka; pilih satu file dulu sebelum tombol upload tampil.")
-    print("- Setelah /d1, /aria2, atau /gdl selesai, bot menampilkan tombol upload: Telegram / rclone GDrive / rclone Terabox")
+    print("- Setelah selesai: jika pilih tujuan upload, bot auto-upload; jika pilih Lewati, upload lanjutan tidak dijalankan.")
     print("- Jika upload gagal, gunakan tombol `Retry Terakhir` atau pilih tujuan upload lagi")
     print(
         f"- Remote rclone: GDrive=`{RCLONE_GDRIVE_REMOTE or '(belum diatur)'}`, "
