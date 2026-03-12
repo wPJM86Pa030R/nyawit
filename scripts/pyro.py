@@ -608,27 +608,18 @@ def is_gofile_source_url(url: str) -> bool:
 def parse_gallery_dl_dump_json_entries(raw_text: str, max_entries: int = 2000) -> List[str]:
     entries: List[str] = []
     safe_max = max(1, int(max_entries))
-    for raw_line in raw_text.splitlines():
+
+    def append_payload_item(payload_item) -> None:
         if len(entries) >= safe_max:
-            break
+            return
+        if not isinstance(payload_item, dict):
+            return
 
-        line = raw_line.strip()
-        if not line or not line.startswith("{"):
-            continue
-
-        try:
-            payload = json.loads(line)
-        except Exception:
-            continue
-
-        if not isinstance(payload, dict):
-            continue
-
-        file_url = str(payload.get("url") or "").strip()
-        filename = str(payload.get("filename") or "").strip()
-        extension = str(payload.get("extension") or "").strip().lstrip(".")
+        file_url = str(payload_item.get("url") or "").strip()
+        filename = str(payload_item.get("filename") or "").strip()
+        extension = str(payload_item.get("extension") or "").strip().lstrip(".")
         if not file_url and not filename and not extension:
-            continue
+            return
 
         entry_index = len(entries) + 1
 
@@ -644,6 +635,27 @@ def parse_gallery_dl_dump_json_entries(raw_text: str, max_entries: int = 2000) -
             filename = f"Item {entry_index}"
 
         entries.append(filename)
+
+    for raw_line in raw_text.splitlines():
+        if len(entries) >= safe_max:
+            break
+
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+        if isinstance(payload, list):
+            for item in payload:
+                append_payload_item(item)
+                if len(entries) >= safe_max:
+                    break
+            continue
+        append_payload_item(payload)
 
     return entries
 
@@ -1110,8 +1122,8 @@ def build_gdl_download_picker_keyboard(
     if nav_row:
         rows.append(nav_row)
 
-    rows.append([InlineKeyboardButton("Download All", callback_data=f"gdlpick|{token}|all")])
     rows.append([InlineKeyboardButton("Batal", callback_data=f"gdlpick|{token}|cancel")])
+    rows.append([InlineKeyboardButton("Download All", callback_data=f"gdlpick|{token}|all")])
     return InlineKeyboardMarkup(rows)
 
 
