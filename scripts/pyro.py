@@ -596,6 +596,24 @@ def has_gallery_dl_range_option(command_args: List[str]) -> bool:
     return False
 
 
+def inject_gallery_dl_range_before_urls(command_args: List[str], range_text: str) -> List[str]:
+    prepared_args = [str(item) for item in (command_args or [])]
+    if not prepared_args:
+        return ["--range", str(range_text)]
+
+    resolved: List[str] = []
+    inserted = False
+    for arg in prepared_args:
+        if not inserted and is_direct_url(arg):
+            resolved.extend(["--range", str(range_text)])
+            inserted = True
+        resolved.append(arg)
+
+    if not inserted:
+        resolved = ["--range", str(range_text), *prepared_args]
+    return resolved
+
+
 def is_gofile_source_url(url: str) -> bool:
     cleaned = (url or "").strip().lower()
     return cleaned.startswith("http://gofile.io/") or cleaned.startswith(
@@ -3420,6 +3438,7 @@ async def gallery_dl_download_command(client: Client, message):
     source_count = len(source_urls or [])
     effective_gallery_args = list(gallery_args or [])
     selected_file_name = ""
+    single_file_mode = False
     download_scope_label = "Semua file (default)"
     probe_warning = ""
     status_message = None
@@ -3514,9 +3533,11 @@ async def gallery_dl_download_command(client: Client, message):
                         )
                         return
                     selected_file_name = str(picker_entries[selected_index]).replace("`", "'")
-                    effective_gallery_args.extend(
-                        ["--range", f"{selected_index + 1}-{selected_index + 1}"]
+                    effective_gallery_args = inject_gallery_dl_range_before_urls(
+                        effective_gallery_args,
+                        f"{selected_index + 1}-{selected_index + 1}",
                     )
+                    single_file_mode = True
                     download_scope_label = f"Single file #{selected_index + 1}"
                 else:
                     download_scope_label = "Download All"
@@ -3699,6 +3720,43 @@ async def gallery_dl_download_command(client: Client, message):
             before_snapshot=before_snapshot,
             started_at=started_at,
         )
+        single_cleanup_note = ""
+        if single_file_mode and downloaded_files:
+            preferred_matches = []
+            if selected_file_name:
+                preferred_matches = [
+                    item
+                    for item in downloaded_files
+                    if item.name.strip().lower() == selected_file_name.strip().lower()
+                ]
+                if not preferred_matches:
+                    selected_stem = Path(selected_file_name).stem.strip().lower()
+                    if selected_stem:
+                        preferred_matches = [
+                            item
+                            for item in downloaded_files
+                            if item.stem.strip().lower() == selected_stem
+                        ]
+            selected_path = preferred_matches[0] if preferred_matches else downloaded_files[0]
+            extra_paths = [item for item in downloaded_files if item != selected_path]
+            removed_count = 0
+            failed_remove_count = 0
+            for extra_path in extra_paths:
+                try:
+                    extra_path.unlink()
+                    removed_count += 1
+                except Exception:
+                    failed_remove_count += 1
+            downloaded_files = [selected_path]
+            if removed_count or failed_remove_count:
+                single_cleanup_note = (
+                    f"Single mode cleanup: hapus `{removed_count}` file tambahan"
+                    + (
+                        f", gagal hapus `{failed_remove_count}` file."
+                        if failed_remove_count
+                        else "."
+                    )
+                )
         summary_lines = [
             "gallery-dl selesai.",
             f"Target folder: `{target_dir}`",
@@ -3708,6 +3766,8 @@ async def gallery_dl_download_command(client: Client, message):
         ]
         if selected_file_name:
             summary_lines.append(f"File terpilih: `{selected_file_name}`")
+        if single_cleanup_note:
+            summary_lines.append(single_cleanup_note)
         if downloaded_files:
             token = register_aria2_upload_job(
                 requester_id=getattr(message.from_user, "id", None),
