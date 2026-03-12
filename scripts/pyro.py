@@ -161,6 +161,7 @@ U1_FOLDER_MODE_SESSIONS: Dict[str, Dict[str, object]] = {}
 RCLONE_OUTPUT_SESSIONS: Dict[str, Dict[str, object]] = {}
 EXTRACT_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
 EXTRACT_FILE_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
+EXTRACT_DELETE_CONFIRM_SESSIONS: Dict[str, Dict[str, object]] = {}
 
 EXTRACT_MODES = ("unrar", "unzip", "untar", "un7z")
 
@@ -810,6 +811,7 @@ def cleanup_expired_aria2_upload_jobs() -> None:
     cleanup_expired_rclone_output_sessions()
     cleanup_expired_extract_pick_sessions()
     cleanup_expired_extract_file_pick_sessions()
+    cleanup_expired_extract_delete_confirm_sessions()
 
 
 def register_pending_upload_choice(
@@ -1085,6 +1087,17 @@ def cleanup_expired_extract_file_pick_sessions() -> None:
         EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
 
 
+def cleanup_expired_extract_delete_confirm_sessions() -> None:
+    now = time.time()
+    expired_tokens: List[str] = []
+    for token, payload in EXTRACT_DELETE_CONFIRM_SESSIONS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        EXTRACT_DELETE_CONFIRM_SESSIONS.pop(token, None)
+
+
 def register_extract_pick_session(
     requester_id: Optional[int],
     source_inputs: List[str],
@@ -1099,6 +1112,7 @@ def register_extract_pick_session(
     while (
         token in EXTRACT_PICK_SESSIONS
         or token in EXTRACT_FILE_PICK_SESSIONS
+        or token in EXTRACT_DELETE_CONFIRM_SESSIONS
         or token in RCLONE_OUTPUT_SESSIONS
         or token in U1_FILE_PICK_SESSIONS
         or token in U1_FOLDER_MODE_SESSIONS
@@ -1132,6 +1146,7 @@ def register_extract_file_pick_session(
     while (
         token in EXTRACT_FILE_PICK_SESSIONS
         or token in EXTRACT_PICK_SESSIONS
+        or token in EXTRACT_DELETE_CONFIRM_SESSIONS
         or token in RCLONE_OUTPUT_SESSIONS
         or token in U1_FILE_PICK_SESSIONS
         or token in U1_FOLDER_MODE_SESSIONS
@@ -1158,6 +1173,46 @@ def resolve_extract_file_pick_paths(payload: Dict[str, object]) -> List[Path]:
     return normalize_existing_file_paths([Path(str(item)) for item in files_raw])
 
 
+def register_extract_delete_confirm_session(
+    requester_id: Optional[int],
+    archive_paths: List[Path],
+    summary_text: str,
+) -> Optional[str]:
+    valid_files = normalize_existing_file_paths(archive_paths)
+    if not valid_files:
+        return None
+
+    cleanup_expired_extract_delete_confirm_sessions()
+    token = secrets.token_hex(4)
+    while (
+        token in EXTRACT_DELETE_CONFIRM_SESSIONS
+        or token in EXTRACT_FILE_PICK_SESSIONS
+        or token in EXTRACT_PICK_SESSIONS
+        or token in RCLONE_OUTPUT_SESSIONS
+        or token in U1_FILE_PICK_SESSIONS
+        or token in U1_FOLDER_MODE_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+    ):
+        token = secrets.token_hex(4)
+
+    EXTRACT_DELETE_CONFIRM_SESSIONS[token] = {
+        "requester_id": requester_id,
+        "archive_paths": [str(item) for item in valid_files],
+        "summary_text": str(summary_text).strip(),
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
+
+
+def resolve_extract_delete_confirm_paths(payload: Dict[str, object]) -> List[Path]:
+    files_raw = payload.get("archive_paths")
+    if not isinstance(files_raw, list):
+        return []
+    return normalize_existing_file_paths([Path(str(item)) for item in files_raw])
+
+
 def register_rclone_output_session(
     requester_id: Optional[int],
     summary_lines: List[str],
@@ -1175,6 +1230,7 @@ def register_rclone_output_session(
         or token in U1_FOLDER_MODE_SESSIONS
         or token in EXTRACT_PICK_SESSIONS
         or token in EXTRACT_FILE_PICK_SESSIONS
+        or token in EXTRACT_DELETE_CONFIRM_SESSIONS
         or token in ARIA2_UPLOAD_JOBS
         or token in ARIA2_PENDING_UPLOAD_CHOICES
     ):
@@ -1493,6 +1549,15 @@ def build_extract_file_picker_text(
         ]
     )
     return trim_output("\n".join(lines))
+
+
+def build_extract_delete_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ya, hapus arsip", callback_data=f"xdel|{token}|yes")],
+            [InlineKeyboardButton("Tidak, simpan arsip", callback_data=f"xdel|{token}|no")],
+        ]
+    )
 
 
 def build_upload_summary(
@@ -2779,6 +2844,7 @@ async def execute_extract_operation(
     source_inputs: List[str],
     extract_mode: str,
     target_dir: Path,
+    requester_id: Optional[int] = None,
 ) -> None:
     normalized_mode = str(extract_mode or "").strip().lower()
     if normalized_mode not in EXTRACT_MODES:
@@ -2816,6 +2882,7 @@ async def execute_extract_operation(
             )
 
     success_lines = []
+    success_archive_paths: List[Path] = []
     for archive_path in matching_candidates:
         if not path_exists_or_symlink(archive_path):
             failed_lines.append(f"- `{archive_path}` -> path tidak ditemukan")
@@ -2861,6 +2928,7 @@ async def execute_extract_operation(
             success_lines.append(
                 f"- `{archive_path.name}` -> `{target_dir}` (via `{extractor_name}`)"
             )
+            success_archive_paths.append(archive_path)
             continue
 
         reason = "timeout" if timed_out else f"exit code {process.returncode}"
@@ -2903,11 +2971,34 @@ async def execute_extract_operation(
         if len(skipped_lines) > 10:
             summary_lines.append(f"... {len(skipped_lines) - 10} item lain.")
 
+    summary_text = trim_output("\n".join(summary_lines))
+    summary_markup = None
+
+    if success_archive_paths:
+        effective_requester_id = requester_id
+        if not isinstance(effective_requester_id, int):
+            fallback_requester = getattr(getattr(command_message, "from_user", None), "id", None)
+            effective_requester_id = fallback_requester if isinstance(fallback_requester, int) else None
+
+        delete_token = register_extract_delete_confirm_session(
+            requester_id=effective_requester_id,
+            archive_paths=success_archive_paths,
+            summary_text=summary_text,
+        )
+        if delete_token:
+            summary_text = trim_output(
+                f"{summary_text}\n\n"
+                f"Arsip berhasil diekstrak: `{len(success_archive_paths)}`.\n"
+                "Hapus file arsip sumber?\n"
+                f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`."
+            )
+            summary_markup = build_extract_delete_confirm_keyboard(delete_token)
+
     await update_status_message(
         command_message,
         status_message,
-        trim_output("\n".join(summary_lines)),
-        reply_markup=None,
+        summary_text,
+        reply_markup=summary_markup,
     )
 
 
@@ -4890,6 +4981,112 @@ async def extract_file_pick_callback(client: Client, callback_query):
         source_inputs=[str(selected_path)],
         extract_mode=extract_mode,
         target_dir=target_dir,
+        requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^xdel\|"))
+async def extract_delete_confirm_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, action = parts
+    cleanup_expired_extract_delete_confirm_sessions()
+    session_payload = EXTRACT_DELETE_CONFIRM_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Konfirmasi hapus arsip sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /extract.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    base_summary_text = str(session_payload.get("summary_text") or "").strip()
+    if not base_summary_text:
+        base_summary_text = "extract selesai."
+
+    if action == "no":
+        EXTRACT_DELETE_CONFIRM_SESSIONS.pop(token, None)
+        await callback_query.answer("Arsip sumber tetap disimpan.")
+        await update_status_message(
+            status_message,
+            status_message,
+            trim_output(
+                f"{base_summary_text}\n\n"
+                "Pilihan hapus arsip: `Tidak`.\n"
+                "File arsip sumber tidak dihapus."
+            ),
+            reply_markup=None,
+        )
+        return
+
+    if action != "yes":
+        await callback_query.answer("Pilihan tombol tidak dikenal.", show_alert=True)
+        return
+
+    archive_paths_raw = session_payload.get("archive_paths")
+    total_targets = len(archive_paths_raw) if isinstance(archive_paths_raw, list) else 0
+    archive_paths = resolve_extract_delete_confirm_paths(session_payload)
+
+    deleted_lines: List[str] = []
+    failed_lines: List[str] = []
+    for archive_path in archive_paths:
+        if archive_path.is_dir():
+            failed_lines.append(f"- `{archive_path}` -> path folder tidak dihapus")
+            continue
+        try:
+            archive_path.unlink()
+            deleted_lines.append(f"- `{archive_path.name}`")
+        except Exception as e:
+            failed_lines.append(f"- `{archive_path}` -> {e}")
+
+    EXTRACT_DELETE_CONFIRM_SESSIONS.pop(token, None)
+    missing_count = max(0, total_targets - len(archive_paths))
+
+    summary_lines = [
+        base_summary_text,
+        "",
+        "Pilihan hapus arsip: `Ya`.",
+        f"Target arsip: `{total_targets}`",
+        f"Berhasil dihapus: `{len(deleted_lines)}`",
+        f"Gagal dihapus: `{len(failed_lines)}`",
+    ]
+    if missing_count:
+        summary_lines.append(f"Tidak ditemukan saat proses hapus: `{missing_count}`")
+
+    if deleted_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar terhapus:")
+        summary_lines.extend(deleted_lines[:20])
+        if len(deleted_lines) > 20:
+            summary_lines.append(f"... {len(deleted_lines) - 20} arsip lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Daftar gagal hapus:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    await callback_query.answer("Proses hapus arsip selesai.")
+    await update_status_message(
+        status_message,
+        status_message,
+        trim_output("\n".join(summary_lines)),
+        reply_markup=None,
     )
 
 
