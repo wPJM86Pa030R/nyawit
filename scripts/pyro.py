@@ -134,6 +134,8 @@ LIST_MAX_CHARS = int(os.getenv("LIST_MAX_CHARS", "3800"))
 RCLONE_PAGE_BODY_CHARS = max(500, LIST_MAX_CHARS - 1000)
 U1_PICKER_PAGE_SIZE = 20
 U1_PICKER_BUTTONS_PER_ROW = 5
+GDL_PICKER_PAGE_SIZE = 20
+GDL_PICKER_BUTTONS_PER_ROW = 5
 UPLOAD_CONTROL = {"task": None, "cancel_event": None}
 DOWNLOAD_CONTROL = {
     "task": None,
@@ -146,6 +148,7 @@ DOWNLOAD_CONTROL = {
 ARIA2_UPLOAD_JOBS: Dict[str, Dict[str, object]] = {}
 ARIA2_PENDING_UPLOAD_CHOICES: Dict[str, Dict[str, object]] = {}
 U1_FILE_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
+GDL_DOWNLOAD_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
 RCLONE_OUTPUT_SESSIONS: Dict[str, Dict[str, object]] = {}
 
 
@@ -572,10 +575,107 @@ def parse_gallery_dl_command_args(
             "`/gdl -o directory=\"\" <url>`\n"
             "`/gdl` sambil reply link direct (http/https/ftp)\n"
             "Default otomatis: `-d /home/runner/downloads -o directory=\"\"`\n"
+            "Khusus GoFile multi-file: akan muncul tombol `single file` / `Download All`\n"
             "Alias kompatibilitas: `/gallerydl`"
         )
 
     return command_args, target_dir, urls, None
+
+
+def has_gallery_dl_range_option(command_args: List[str]) -> bool:
+    i = 0
+    while i < len(command_args):
+        arg = command_args[i]
+        if arg in {"--range", "-R"}:
+            return True
+        if arg.startswith("--range="):
+            return True
+        if arg.startswith("-R") and len(arg) > 2:
+            return True
+        i += 1
+    return False
+
+
+def is_gofile_source_url(url: str) -> bool:
+    cleaned = (url or "").strip().lower()
+    return cleaned.startswith("http://gofile.io/") or cleaned.startswith(
+        "https://gofile.io/"
+    ) or cleaned.startswith("http://www.gofile.io/") or cleaned.startswith(
+        "https://www.gofile.io/"
+    )
+
+
+def parse_gallery_dl_dump_json_entries(raw_text: str, max_entries: int = 2000) -> List[str]:
+    entries: List[str] = []
+    safe_max = max(1, int(max_entries))
+    for raw_line in raw_text.splitlines():
+        if len(entries) >= safe_max:
+            break
+
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        file_url = str(payload.get("url") or "").strip()
+        filename = str(payload.get("filename") or "").strip()
+        extension = str(payload.get("extension") or "").strip().lstrip(".")
+        if not file_url and not filename and not extension:
+            continue
+
+        entry_index = len(entries) + 1
+
+        if filename and extension and not filename.lower().endswith(f".{extension.lower()}"):
+            filename = f"{filename}.{extension}"
+
+        if not filename and file_url:
+            url_without_query = file_url.split("?", 1)[0].rstrip("/")
+            if "/" in url_without_query:
+                filename = url_without_query.rsplit("/", 1)[-1].strip()
+
+        if not filename:
+            filename = f"Item {entry_index}"
+
+        entries.append(filename)
+
+    return entries
+
+
+async def probe_gallery_dl_entries(command_args: List[str]) -> Tuple[List[str], str]:
+    probe_command = [GALLERY_DL_BIN, "--simulate", "--dump-json", *(command_args or [])]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *probe_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return [], (
+            "gallery-dl tidak ditemukan saat memeriksa isi link.\n"
+            f"Set env `GALLERY_DL_BIN` (saat ini: `{GALLERY_DL_BIN}`) ke binary gallery-dl yang valid."
+        )
+    except Exception as e:
+        return [], f"Gagal memeriksa isi link via gallery-dl: `{e}`"
+
+    stdout_data, stderr_data = await process.communicate()
+    stdout_text = stdout_data.decode("utf-8", errors="replace").strip() if stdout_data else ""
+    stderr_text = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
+    entries = parse_gallery_dl_dump_json_entries(stdout_text)
+
+    if process.returncode != 0:
+        stderr_tail = "\n".join(stderr_text.splitlines()[-8:]) if stderr_text else ""
+        stdout_tail = "\n".join(stdout_text.splitlines()[-8:]) if stdout_text else ""
+        detail = stderr_tail or stdout_tail or f"return code {process.returncode}"
+        return entries, f"Gagal membaca daftar file untuk pilihan single/multi (`{detail}`)."
+
+    return entries, ""
 
 
 ARIA2_SIZE_RE = re.compile(
@@ -789,6 +889,7 @@ def cleanup_expired_aria2_upload_jobs() -> None:
         ARIA2_PENDING_UPLOAD_CHOICES.pop(token, None)
 
     # Keep other button-based sessions in sync with the same TTL cleanup cycle.
+    cleanup_expired_gdl_download_pick_sessions()
     cleanup_expired_u1_file_pick_sessions()
     cleanup_expired_rclone_output_sessions()
 
@@ -800,7 +901,11 @@ def register_pending_upload_choice(
 ) -> str:
     cleanup_expired_aria2_upload_jobs()
     token = secrets.token_hex(4)
-    while token in ARIA2_UPLOAD_JOBS or token in ARIA2_PENDING_UPLOAD_CHOICES:
+    while (
+        token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+        or token in GDL_DOWNLOAD_PICK_SESSIONS
+    ):
         token = secrets.token_hex(4)
 
     ARIA2_PENDING_UPLOAD_CHOICES[token] = {
@@ -850,7 +955,11 @@ def register_aria2_upload_job(
         return None
     resolved_token = token or secrets.token_hex(4)
     while (
-        (resolved_token in ARIA2_UPLOAD_JOBS or resolved_token in ARIA2_PENDING_UPLOAD_CHOICES)
+        (
+            resolved_token in ARIA2_UPLOAD_JOBS
+            or resolved_token in ARIA2_PENDING_UPLOAD_CHOICES
+            or resolved_token in GDL_DOWNLOAD_PICK_SESSIONS
+        )
         and resolved_token != token
     ):
         resolved_token = secrets.token_hex(4)
@@ -906,6 +1015,140 @@ def resolve_aria2_job_files(job_payload: Dict[str, object]) -> List[Path]:
     return normalize_existing_file_paths([Path(str(raw)) for raw in files_raw])
 
 
+def cleanup_expired_gdl_download_pick_sessions() -> None:
+    now = time.time()
+    expired_tokens: List[str] = []
+    for token, payload in GDL_DOWNLOAD_PICK_SESSIONS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
+
+
+def register_gdl_download_pick_session(
+    requester_id: Optional[int],
+    chat_id: int,
+    source_input: str,
+    files: List[str],
+) -> Optional[str]:
+    prepared_files = [str(item).strip() for item in files if str(item).strip()]
+    if len(prepared_files) <= 1:
+        return None
+
+    cleanup_expired_gdl_download_pick_sessions()
+    token = secrets.token_hex(4)
+    while (
+        token in GDL_DOWNLOAD_PICK_SESSIONS
+        or token in U1_FILE_PICK_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+        or token in RCLONE_OUTPUT_SESSIONS
+    ):
+        token = secrets.token_hex(4)
+
+    GDL_DOWNLOAD_PICK_SESSIONS[token] = {
+        "requester_id": requester_id,
+        "chat_id": chat_id,
+        "source_input": source_input.strip(),
+        "files": prepared_files,
+        "selected_mode": None,
+        "selected_index": None,
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
+
+
+def resolve_gdl_download_pick_entries(payload: Dict[str, object]) -> List[str]:
+    files_raw = payload.get("files")
+    if not isinstance(files_raw, list):
+        return []
+    return [str(item).strip() for item in files_raw if str(item).strip()]
+
+
+def build_gdl_download_picker_keyboard(
+    token: str,
+    total_files: int,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    safe_total = max(0, int(total_files))
+    if safe_total <= 0:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Batal", callback_data=f"gdlpick|{token}|cancel")]]
+        )
+
+    page_count = max(1, (safe_total + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(int(page), page_count - 1))
+    start = safe_page * GDL_PICKER_PAGE_SIZE
+    end = min(safe_total, start + GDL_PICKER_PAGE_SIZE)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    current_row: List[InlineKeyboardButton] = []
+    for file_index in range(start, end):
+        current_row.append(
+            InlineKeyboardButton(
+                str(file_index + 1),
+                callback_data=f"gdlpick|{token}|{file_index}",
+            )
+        )
+        if len(current_row) >= GDL_PICKER_BUTTONS_PER_ROW:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+
+    nav_row: List[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(
+            InlineKeyboardButton("Prev", callback_data=f"gdlpage|{token}|{safe_page - 1}")
+        )
+    if safe_page < (page_count - 1):
+        nav_row.append(
+            InlineKeyboardButton("Next", callback_data=f"gdlpage|{token}|{safe_page + 1}")
+        )
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("Download All", callback_data=f"gdlpick|{token}|all")])
+    rows.append([InlineKeyboardButton("Batal", callback_data=f"gdlpick|{token}|cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_gdl_download_picker_text(
+    source_input: str,
+    files: List[str],
+    page: int = 0,
+) -> str:
+    total_files = len(files)
+    if total_files <= 0:
+        return "Tidak ada file terdeteksi untuk pilihan /gdl."
+
+    page_count = max(1, (total_files + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(int(page), page_count - 1))
+    start = safe_page * GDL_PICKER_PAGE_SIZE
+    end = min(total_files, start + GDL_PICKER_PAGE_SIZE)
+
+    lines = [
+        "Pilih mode download /gdl.",
+        f"Sumber: `{source_input}`",
+        f"Total file: `{total_files}`",
+        "",
+        "Tekan nomor untuk download satu file, atau tekan `Download All`.",
+        "",
+        "Daftar file:",
+    ]
+    for index, file_name in enumerate(files[start:end], start=start + 1):
+        safe_name = str(file_name).replace("`", "'")
+        lines.append(f"{index}. `{safe_name}`")
+
+    if page_count > 1:
+        lines.append("")
+        lines.append(f"Halaman `{safe_page + 1}/{page_count}`")
+
+    return trim_output("\n".join(lines))
+
+
 def cleanup_expired_u1_file_pick_sessions() -> None:
     now = time.time()
     expired_tokens: List[str] = []
@@ -930,7 +1173,12 @@ def register_u1_file_pick_session(
 
     cleanup_expired_u1_file_pick_sessions()
     token = secrets.token_hex(4)
-    while token in U1_FILE_PICK_SESSIONS or token in ARIA2_UPLOAD_JOBS or token in ARIA2_PENDING_UPLOAD_CHOICES:
+    while (
+        token in U1_FILE_PICK_SESSIONS
+        or token in GDL_DOWNLOAD_PICK_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+    ):
         token = secrets.token_hex(4)
 
     U1_FILE_PICK_SESSIONS[token] = {
@@ -1008,6 +1256,7 @@ def register_rclone_output_session(
     while (
         token in RCLONE_OUTPUT_SESSIONS
         or token in U1_FILE_PICK_SESSIONS
+        or token in GDL_DOWNLOAD_PICK_SESSIONS
         or token in ARIA2_UPLOAD_JOBS
         or token in ARIA2_PENDING_UPLOAD_CHOICES
     ):
@@ -3157,7 +3406,113 @@ async def gallery_dl_download_command(client: Client, message):
         return
 
     source_count = len(source_urls or [])
-    command = [GALLERY_DL_BIN, *(gallery_args or [])]
+    effective_gallery_args = list(gallery_args or [])
+    selected_file_name = ""
+    download_scope_label = "Semua file (default)"
+    probe_warning = ""
+    status_message = None
+
+    should_offer_picker = (
+        source_count == 1
+        and bool(source_urls)
+        and is_gofile_source_url(str(source_urls[0]))
+        and not has_gallery_dl_range_option(effective_gallery_args)
+    )
+    if should_offer_picker:
+        probe_entries, probe_warning = await probe_gallery_dl_entries(effective_gallery_args)
+        if len(probe_entries) > 1:
+            picker_token = register_gdl_download_pick_session(
+                requester_id=getattr(message.from_user, "id", None),
+                chat_id=message.chat.id,
+                source_input=str(source_urls[0]),
+                files=probe_entries,
+            )
+            if picker_token:
+                status_message = await open_status_message(
+                    message,
+                    build_gdl_download_picker_text(
+                        source_input=str(source_urls[0]),
+                        files=probe_entries,
+                        page=0,
+                    ),
+                    reply_markup=build_gdl_download_picker_keyboard(
+                        token=picker_token,
+                        total_files=len(probe_entries),
+                        page=0,
+                    ),
+                )
+
+                selected_mode = ""
+                selected_index: Optional[int] = None
+                wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
+                while time.time() < wait_deadline:
+                    picker_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(picker_token)
+                    if not picker_payload:
+                        await update_status_message(
+                            message,
+                            status_message,
+                            "Sesi pilihan file /gdl tidak ditemukan atau sudah kedaluwarsa.",
+                            reply_markup=None,
+                        )
+                        return
+
+                    selected_mode = str(picker_payload.get("selected_mode") or "").strip()
+                    raw_selected_index = picker_payload.get("selected_index")
+                    if selected_mode in {"all", "single", "cancel"}:
+                        if selected_mode == "single":
+                            try:
+                                selected_index = int(raw_selected_index)
+                            except Exception:
+                                selected_index = None
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
+                    await update_status_message(
+                        message,
+                        status_message,
+                        "Waktu memilih file /gdl habis. Jalankan `/gdl` lagi.",
+                        reply_markup=None,
+                    )
+                    return
+
+                picker_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(picker_token) or {}
+                picker_entries = resolve_gdl_download_pick_entries(picker_payload)
+                if selected_mode == "cancel":
+                    GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
+                    await update_status_message(
+                        message,
+                        status_message,
+                        "Pemilihan file /gdl dibatalkan.",
+                        reply_markup=None,
+                    )
+                    return
+                if selected_mode == "single":
+                    if (
+                        selected_index is None
+                        or selected_index < 0
+                        or selected_index >= len(picker_entries)
+                    ):
+                        GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
+                        await update_status_message(
+                            message,
+                            status_message,
+                            "Pilihan file /gdl tidak valid.",
+                            reply_markup=None,
+                        )
+                        return
+                    selected_file_name = str(picker_entries[selected_index]).replace("`", "'")
+                    effective_gallery_args.extend(
+                        ["--range", f"{selected_index + 1}-{selected_index + 1}"]
+                    )
+                    download_scope_label = f"Single file #{selected_index + 1}"
+                else:
+                    download_scope_label = "Download All"
+
+                GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
+        elif len(probe_entries) == 1:
+            download_scope_label = "Single file (sumber hanya 1 file)"
+    command = [GALLERY_DL_BIN, *effective_gallery_args]
     preselect_token = register_pending_upload_choice(
         requester_id=getattr(message.from_user, "id", None),
         chat_id=message.chat.id,
@@ -3165,15 +3520,34 @@ async def gallery_dl_download_command(client: Client, message):
     )
     preselect_markup = build_aria2_upload_keyboard(preselect_token)
 
-    status_message = await open_status_message(
-        message,
-        "Permintaan /gdl diterima.\n"
-        "Pilih tujuan upload dulu lewat tombol di bawah.\n"
-        "Download baru akan mulai setelah kamu memilih.\n\n"
-        f"Target folder: `{target_dir}`\n"
+    preselect_lines = [
+        "Permintaan /gdl diterima.",
+        "Pilih tujuan upload dulu lewat tombol di bawah.",
+        "Download baru akan mulai setelah kamu memilih.",
+        "",
+        f"Target folder: `{target_dir}`",
         f"Sumber: `{source_count}` URL",
-        reply_markup=preselect_markup,
-    )
+        f"Mode download: `{download_scope_label}`",
+    ]
+    if selected_file_name:
+        preselect_lines.append(f"File terpilih: `{selected_file_name}`")
+    if probe_warning:
+        preselect_lines.extend(["", probe_warning])
+
+    preselect_text = trim_output("\n".join(preselect_lines))
+    if status_message:
+        status_message = await update_status_message(
+            message,
+            status_message,
+            preselect_text,
+            reply_markup=preselect_markup,
+        )
+    else:
+        status_message = await open_status_message(
+            message,
+            preselect_text,
+            reply_markup=preselect_markup,
+        )
 
     selected_action = ""
     wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
@@ -3209,14 +3583,21 @@ async def gallery_dl_download_command(client: Client, message):
         "tb": "rclone Terabox",
         "skip": "Lewati upload",
     }.get(selected_action, selected_action)
+    start_lines = [
+        "Pilihan upload sudah disimpan.",
+        f"Tujuan: `{action_label}`",
+        "",
+        "Memulai download via gallery-dl...",
+        f"Target folder: `{target_dir}`",
+        f"Sumber: `{source_count}` URL",
+        f"Mode download: `{download_scope_label}`",
+    ]
+    if selected_file_name:
+        start_lines.append(f"File terpilih: `{selected_file_name}`")
     status_message = await update_status_message(
         message,
         status_message,
-        "Pilihan upload sudah disimpan.\n"
-        f"Tujuan: `{action_label}`\n\n"
-        "Memulai download via gallery-dl...\n"
-        f"Target folder: `{target_dir}`\n"
-        f"Sumber: `{source_count}` URL",
+        trim_output("\n".join(start_lines)),
         reply_markup=None,
     )
 
@@ -3275,9 +3656,12 @@ async def gallery_dl_download_command(client: Client, message):
                     f"PID: `{process.pid}`",
                     f"Target folder: `{target_dir}`",
                     f"Sumber URL: `{source_count}`",
+                    f"Mode download: `{download_scope_label}`",
                     f"Elapsed: `{elapsed}`",
                     f"Update terakhir: `{update_age}` lalu",
                 ]
+                if selected_file_name:
+                    progress_lines.append(f"File terpilih: `{selected_file_name}`")
                 raw_line = progress_state.get("line")
                 if raw_line:
                     progress_lines.append("")
@@ -3308,7 +3692,10 @@ async def gallery_dl_download_command(client: Client, message):
             f"Target folder: `{target_dir}`",
             f"Durasi: `{elapsed_text}`",
             f"Return code: `{process.returncode}`",
+            f"Mode download: `{download_scope_label}`",
         ]
+        if selected_file_name:
+            summary_lines.append(f"File terpilih: `{selected_file_name}`")
         if downloaded_files:
             token = register_aria2_upload_job(
                 requester_id=getattr(message.from_user, "id", None),
@@ -3384,7 +3771,10 @@ async def gallery_dl_download_command(client: Client, message):
         f"Target folder: `{target_dir}`",
         f"Durasi: `{elapsed_text}`",
         f"Return code: `{process.returncode}`",
+        f"Mode download: `{download_scope_label}`",
     ]
+    if selected_file_name:
+        failed_lines.append(f"File terpilih: `{selected_file_name}`")
     if stderr_tail:
         failed_lines.append("")
         failed_lines.append("Error gallery-dl (stderr):")
@@ -3584,6 +3974,170 @@ async def rclone_output_page_callback(client: Client, callback_query):
         ),
     )
     await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^gdlpage\|"))
+async def gdl_download_page_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, page_text = parts
+    try:
+        requested_page = int(page_text)
+    except ValueError:
+        await callback_query.answer("Nomor halaman tidak valid.", show_alert=True)
+        return
+
+    cleanup_expired_gdl_download_pick_sessions()
+    session_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Pilihan file /gdl sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /gdl.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    entries = resolve_gdl_download_pick_entries(session_payload)
+    if len(entries) <= 1:
+        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Daftar file /gdl tidak tersedia lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /gdl dibatalkan: daftar file tidak tersedia.",
+            reply_markup=None,
+        )
+        return
+
+    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+    page_count = max(1, (len(entries) + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(requested_page, page_count - 1))
+    source_input = str(session_payload.get("source_input") or "").strip()
+    await update_status_message(
+        status_message,
+        status_message,
+        build_gdl_download_picker_text(
+            source_input=source_input,
+            files=entries,
+            page=safe_page,
+        ),
+        reply_markup=build_gdl_download_picker_keyboard(
+            token=token,
+            total_files=len(entries),
+            page=safe_page,
+        ),
+    )
+    await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^gdlpick\|"))
+async def gdl_download_pick_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, pick_value = parts
+    cleanup_expired_gdl_download_pick_sessions()
+    session_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Pilihan file /gdl sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /gdl.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    entries = resolve_gdl_download_pick_entries(session_payload)
+    if len(entries) <= 1:
+        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Daftar file /gdl tidak tersedia lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /gdl dibatalkan: daftar file tidak tersedia.",
+            reply_markup=None,
+        )
+        return
+
+    if pick_value == "cancel":
+        session_payload["selected_mode"] = "cancel"
+        session_payload["selected_index"] = None
+        session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+        await callback_query.answer("Pemilihan file /gdl dibatalkan.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /gdl dibatalkan.",
+            reply_markup=None,
+        )
+        return
+
+    if pick_value == "all":
+        session_payload["selected_mode"] = "all"
+        session_payload["selected_index"] = None
+        session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+        await callback_query.answer("Download All dipilih.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pilihan file /gdl tersimpan.\nMode: `Download All`.\nMenunggu proses berikutnya...",
+            reply_markup=None,
+        )
+        return
+
+    try:
+        selected_index = int(pick_value)
+    except ValueError:
+        await callback_query.answer("Nomor file tidak valid.", show_alert=True)
+        return
+
+    if selected_index < 0 or selected_index >= len(entries):
+        await callback_query.answer("Nomor file di luar daftar.", show_alert=True)
+        return
+
+    selected_name = entries[selected_index]
+    safe_name = str(selected_name).replace("`", "'")
+    session_payload["selected_mode"] = "single"
+    session_payload["selected_index"] = selected_index
+    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+
+    await callback_query.answer(f"File #{selected_index + 1} dipilih.")
+    await update_status_message(
+        status_message,
+        status_message,
+        "Pilihan file /gdl tersimpan.\n"
+        "Mode: `Single file`\n"
+        f"Nomor: `{selected_index + 1}`\n"
+        f"Nama: `{safe_name}`\n"
+        "Menunggu proses berikutnya...",
+        reply_markup=None,
+    )
 
 
 @app.on_callback_query(filters.regex(r"^u1page\|"))
