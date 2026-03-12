@@ -26,9 +26,10 @@ ARIA2_BIN = os.getenv("ARIA2_BIN", "aria2c")
 GALLERY_DL_BIN = os.getenv("GALLERY_DL_BIN", "gallery-dl")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/runner/downloads")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/runner/downloads")
+EXTRACT_DIR = os.getenv("EXTRACT_DIR", "/home/runner/downloads")
 RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
 RCLONE_GDRIVE_REMOTE = os.getenv("RCLONE_GDRIVE_REMOTE", "").strip()
-RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "").strip()
+RCLONE_TERABOX_REMOTE = os.getenv("RCLONE_TERABOX_REMOTE", "terabox:Mirror").strip()
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
 try:
     RCLONE_COMMAND_TIMEOUT_SECONDS = max(
@@ -36,6 +37,12 @@ try:
     )
 except ValueError:
     RCLONE_COMMAND_TIMEOUT_SECONDS = 900
+try:
+    EXTRACT_COMMAND_TIMEOUT_SECONDS = max(
+        30, int(os.getenv("EXTRACT_COMMAND_TIMEOUT_SECONDS", "900"))
+    )
+except ValueError:
+    EXTRACT_COMMAND_TIMEOUT_SECONDS = 900
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {
     "1",
     "true",
@@ -78,6 +85,8 @@ download_root.mkdir(parents=True, exist_ok=True)
 download_target = f"{download_root}{os.sep}"
 upload_root = Path(UPLOAD_DIR).expanduser().resolve()
 upload_root.mkdir(parents=True, exist_ok=True)
+extract_root = Path(EXTRACT_DIR).expanduser().resolve()
+extract_root.mkdir(parents=True, exist_ok=True)
 
 if BOT_MODE:
     app = Client(
@@ -134,8 +143,8 @@ LIST_MAX_CHARS = int(os.getenv("LIST_MAX_CHARS", "3800"))
 RCLONE_PAGE_BODY_CHARS = max(500, LIST_MAX_CHARS - 1000)
 U1_PICKER_PAGE_SIZE = 20
 U1_PICKER_BUTTONS_PER_ROW = 5
-GDL_PICKER_PAGE_SIZE = 20
-GDL_PICKER_BUTTONS_PER_ROW = 5
+EXTRACT_PICKER_PAGE_SIZE = 10
+EXTRACT_PICKER_BUTTONS_PER_ROW = 5
 UPLOAD_CONTROL = {"task": None, "cancel_event": None}
 DOWNLOAD_CONTROL = {
     "task": None,
@@ -148,8 +157,12 @@ DOWNLOAD_CONTROL = {
 ARIA2_UPLOAD_JOBS: Dict[str, Dict[str, object]] = {}
 ARIA2_PENDING_UPLOAD_CHOICES: Dict[str, Dict[str, object]] = {}
 U1_FILE_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
-GDL_DOWNLOAD_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
+U1_FOLDER_MODE_SESSIONS: Dict[str, Dict[str, object]] = {}
 RCLONE_OUTPUT_SESSIONS: Dict[str, Dict[str, object]] = {}
+EXTRACT_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
+EXTRACT_FILE_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
+
+EXTRACT_MODES = ("unrar", "unzip", "untar", "un7z")
 
 
 def command_filter(name: str, allow_public: bool = False):
@@ -575,137 +588,10 @@ def parse_gallery_dl_command_args(
             "`/gdl -o directory=\"\" <url>`\n"
             "`/gdl` sambil reply link direct (http/https/ftp)\n"
             "Default otomatis: `-d /home/runner/downloads -o directory=\"\"`\n"
-            "Khusus GoFile multi-file: akan muncul tombol `single file` / `Download All`\n"
             "Alias kompatibilitas: `/gallerydl`"
         )
 
     return command_args, target_dir, urls, None
-
-
-def has_gallery_dl_range_option(command_args: List[str]) -> bool:
-    i = 0
-    while i < len(command_args):
-        arg = command_args[i]
-        if arg in {"--range", "-R"}:
-            return True
-        if arg.startswith("--range="):
-            return True
-        if arg.startswith("-R") and len(arg) > 2:
-            return True
-        i += 1
-    return False
-
-
-def inject_gallery_dl_range_before_urls(command_args: List[str], range_text: str) -> List[str]:
-    prepared_args = [str(item) for item in (command_args or [])]
-    if not prepared_args:
-        return ["--range", str(range_text)]
-
-    resolved: List[str] = []
-    inserted = False
-    for arg in prepared_args:
-        if not inserted and is_direct_url(arg):
-            resolved.extend(["--range", str(range_text)])
-            inserted = True
-        resolved.append(arg)
-
-    if not inserted:
-        resolved = ["--range", str(range_text), *prepared_args]
-    return resolved
-
-
-def is_gofile_source_url(url: str) -> bool:
-    cleaned = (url or "").strip().lower()
-    return cleaned.startswith("http://gofile.io/") or cleaned.startswith(
-        "https://gofile.io/"
-    ) or cleaned.startswith("http://www.gofile.io/") or cleaned.startswith(
-        "https://www.gofile.io/"
-    )
-
-
-def parse_gallery_dl_dump_json_entries(raw_text: str, max_entries: int = 2000) -> List[str]:
-    entries: List[str] = []
-    safe_max = max(1, int(max_entries))
-
-    def append_payload_item(payload_item) -> None:
-        if len(entries) >= safe_max:
-            return
-        if not isinstance(payload_item, dict):
-            return
-
-        file_url = str(payload_item.get("url") or "").strip()
-        filename = str(payload_item.get("filename") or "").strip()
-        extension = str(payload_item.get("extension") or "").strip().lstrip(".")
-        if not file_url and not filename and not extension:
-            return
-
-        entry_index = len(entries) + 1
-
-        if filename and extension and not filename.lower().endswith(f".{extension.lower()}"):
-            filename = f"{filename}.{extension}"
-
-        if not filename and file_url:
-            url_without_query = file_url.split("?", 1)[0].rstrip("/")
-            if "/" in url_without_query:
-                filename = url_without_query.rsplit("/", 1)[-1].strip()
-
-        if not filename:
-            filename = f"Item {entry_index}"
-
-        entries.append(filename)
-
-    for raw_line in raw_text.splitlines():
-        if len(entries) >= safe_max:
-            break
-
-        line = raw_line.strip()
-        if not line or not line.startswith("{"):
-            continue
-
-        try:
-            payload = json.loads(line)
-        except Exception:
-            continue
-
-        if isinstance(payload, list):
-            for item in payload:
-                append_payload_item(item)
-                if len(entries) >= safe_max:
-                    break
-            continue
-        append_payload_item(payload)
-
-    return entries
-
-
-async def probe_gallery_dl_entries(command_args: List[str]) -> Tuple[List[str], str]:
-    probe_command = [GALLERY_DL_BIN, "--simulate", "--dump-json", *(command_args or [])]
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *probe_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return [], (
-            "gallery-dl tidak ditemukan saat memeriksa isi link.\n"
-            f"Set env `GALLERY_DL_BIN` (saat ini: `{GALLERY_DL_BIN}`) ke binary gallery-dl yang valid."
-        )
-    except Exception as e:
-        return [], f"Gagal memeriksa isi link via gallery-dl: `{e}`"
-
-    stdout_data, stderr_data = await process.communicate()
-    stdout_text = stdout_data.decode("utf-8", errors="replace").strip() if stdout_data else ""
-    stderr_text = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
-    entries = parse_gallery_dl_dump_json_entries(stdout_text)
-
-    if process.returncode != 0:
-        stderr_tail = "\n".join(stderr_text.splitlines()[-8:]) if stderr_text else ""
-        stdout_tail = "\n".join(stdout_text.splitlines()[-8:]) if stdout_text else ""
-        detail = stderr_tail or stdout_tail or f"return code {process.returncode}"
-        return entries, f"Gagal membaca daftar file untuk pilihan single/multi (`{detail}`)."
-
-    return entries, ""
 
 
 ARIA2_SIZE_RE = re.compile(
@@ -919,9 +805,11 @@ def cleanup_expired_aria2_upload_jobs() -> None:
         ARIA2_PENDING_UPLOAD_CHOICES.pop(token, None)
 
     # Keep other button-based sessions in sync with the same TTL cleanup cycle.
-    cleanup_expired_gdl_download_pick_sessions()
     cleanup_expired_u1_file_pick_sessions()
+    cleanup_expired_u1_folder_mode_sessions()
     cleanup_expired_rclone_output_sessions()
+    cleanup_expired_extract_pick_sessions()
+    cleanup_expired_extract_file_pick_sessions()
 
 
 def register_pending_upload_choice(
@@ -931,11 +819,7 @@ def register_pending_upload_choice(
 ) -> str:
     cleanup_expired_aria2_upload_jobs()
     token = secrets.token_hex(4)
-    while (
-        token in ARIA2_UPLOAD_JOBS
-        or token in ARIA2_PENDING_UPLOAD_CHOICES
-        or token in GDL_DOWNLOAD_PICK_SESSIONS
-    ):
+    while token in ARIA2_UPLOAD_JOBS or token in ARIA2_PENDING_UPLOAD_CHOICES:
         token = secrets.token_hex(4)
 
     ARIA2_PENDING_UPLOAD_CHOICES[token] = {
@@ -949,7 +833,7 @@ def register_pending_upload_choice(
     return token
 
 
-def normalize_existing_file_paths(paths: List[Path]) -> List[Path]:
+def normalize_existing_paths(paths: List[Path], include_dirs: bool = False) -> List[Path]:
     normalized: List[Path] = []
     seen = set()
     for item in paths:
@@ -961,10 +845,14 @@ def normalize_existing_file_paths(paths: List[Path]) -> List[Path]:
         key = str(resolved)
         if key in seen:
             continue
-        if resolved.exists() and resolved.is_file():
+        if resolved.exists() and (resolved.is_file() or (include_dirs and resolved.is_dir())):
             seen.add(key)
             normalized.append(resolved)
     return normalized
+
+
+def normalize_existing_file_paths(paths: List[Path]) -> List[Path]:
+    return normalize_existing_paths(paths, include_dirs=False)
 
 
 def register_aria2_upload_job(
@@ -985,11 +873,7 @@ def register_aria2_upload_job(
         return None
     resolved_token = token or secrets.token_hex(4)
     while (
-        (
-            resolved_token in ARIA2_UPLOAD_JOBS
-            or resolved_token in ARIA2_PENDING_UPLOAD_CHOICES
-            or resolved_token in GDL_DOWNLOAD_PICK_SESSIONS
-        )
+        (resolved_token in ARIA2_UPLOAD_JOBS or resolved_token in ARIA2_PENDING_UPLOAD_CHOICES)
         and resolved_token != token
     ):
         resolved_token = secrets.token_hex(4)
@@ -1045,140 +929,6 @@ def resolve_aria2_job_files(job_payload: Dict[str, object]) -> List[Path]:
     return normalize_existing_file_paths([Path(str(raw)) for raw in files_raw])
 
 
-def cleanup_expired_gdl_download_pick_sessions() -> None:
-    now = time.time()
-    expired_tokens: List[str] = []
-    for token, payload in GDL_DOWNLOAD_PICK_SESSIONS.items():
-        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
-        if expires_at and expires_at <= now:
-            expired_tokens.append(token)
-    for token in expired_tokens:
-        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
-
-
-def register_gdl_download_pick_session(
-    requester_id: Optional[int],
-    chat_id: int,
-    source_input: str,
-    files: List[str],
-) -> Optional[str]:
-    prepared_files = [str(item).strip() for item in files if str(item).strip()]
-    if len(prepared_files) <= 1:
-        return None
-
-    cleanup_expired_gdl_download_pick_sessions()
-    token = secrets.token_hex(4)
-    while (
-        token in GDL_DOWNLOAD_PICK_SESSIONS
-        or token in U1_FILE_PICK_SESSIONS
-        or token in ARIA2_UPLOAD_JOBS
-        or token in ARIA2_PENDING_UPLOAD_CHOICES
-        or token in RCLONE_OUTPUT_SESSIONS
-    ):
-        token = secrets.token_hex(4)
-
-    GDL_DOWNLOAD_PICK_SESSIONS[token] = {
-        "requester_id": requester_id,
-        "chat_id": chat_id,
-        "source_input": source_input.strip(),
-        "files": prepared_files,
-        "selected_mode": None,
-        "selected_index": None,
-        "created_at": time.time(),
-        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
-    }
-    return token
-
-
-def resolve_gdl_download_pick_entries(payload: Dict[str, object]) -> List[str]:
-    files_raw = payload.get("files")
-    if not isinstance(files_raw, list):
-        return []
-    return [str(item).strip() for item in files_raw if str(item).strip()]
-
-
-def build_gdl_download_picker_keyboard(
-    token: str,
-    total_files: int,
-    page: int = 0,
-) -> InlineKeyboardMarkup:
-    safe_total = max(0, int(total_files))
-    if safe_total <= 0:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Batal", callback_data=f"gdlpick|{token}|cancel")]]
-        )
-
-    page_count = max(1, (safe_total + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
-    safe_page = max(0, min(int(page), page_count - 1))
-    start = safe_page * GDL_PICKER_PAGE_SIZE
-    end = min(safe_total, start + GDL_PICKER_PAGE_SIZE)
-
-    rows: List[List[InlineKeyboardButton]] = []
-    current_row: List[InlineKeyboardButton] = []
-    for file_index in range(start, end):
-        current_row.append(
-            InlineKeyboardButton(
-                str(file_index + 1),
-                callback_data=f"gdlpick|{token}|{file_index}",
-            )
-        )
-        if len(current_row) >= GDL_PICKER_BUTTONS_PER_ROW:
-            rows.append(current_row)
-            current_row = []
-    if current_row:
-        rows.append(current_row)
-
-    nav_row: List[InlineKeyboardButton] = []
-    if safe_page > 0:
-        nav_row.append(
-            InlineKeyboardButton("Prev", callback_data=f"gdlpage|{token}|{safe_page - 1}")
-        )
-    if safe_page < (page_count - 1):
-        nav_row.append(
-            InlineKeyboardButton("Next", callback_data=f"gdlpage|{token}|{safe_page + 1}")
-        )
-    if nav_row:
-        rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("Batal", callback_data=f"gdlpick|{token}|cancel")])
-    rows.append([InlineKeyboardButton("Download All", callback_data=f"gdlpick|{token}|all")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_gdl_download_picker_text(
-    source_input: str,
-    files: List[str],
-    page: int = 0,
-) -> str:
-    total_files = len(files)
-    if total_files <= 0:
-        return "Tidak ada file terdeteksi untuk pilihan /gdl."
-
-    page_count = max(1, (total_files + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
-    safe_page = max(0, min(int(page), page_count - 1))
-    start = safe_page * GDL_PICKER_PAGE_SIZE
-    end = min(total_files, start + GDL_PICKER_PAGE_SIZE)
-
-    lines = [
-        "Pilih mode download /gdl.",
-        f"Sumber: `{source_input}`",
-        f"Total file: `{total_files}`",
-        "",
-        "Tekan nomor untuk download satu file, atau tekan `Download All`.",
-        "",
-        "Daftar file:",
-    ]
-    for index, file_name in enumerate(files[start:end], start=start + 1):
-        safe_name = str(file_name).replace("`", "'")
-        lines.append(f"{index}. `{safe_name}`")
-
-    if page_count > 1:
-        lines.append("")
-        lines.append(f"Halaman `{safe_page + 1}/{page_count}`")
-
-    return trim_output("\n".join(lines))
-
-
 def cleanup_expired_u1_file_pick_sessions() -> None:
     now = time.time()
     expired_tokens: List[str] = []
@@ -1190,6 +940,17 @@ def cleanup_expired_u1_file_pick_sessions() -> None:
         U1_FILE_PICK_SESSIONS.pop(token, None)
 
 
+def cleanup_expired_u1_folder_mode_sessions() -> None:
+    now = time.time()
+    expired_tokens: List[str] = []
+    for token, payload in U1_FOLDER_MODE_SESSIONS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+
+
 def register_u1_file_pick_session(
     requester_id: Optional[int],
     command_chat_id: int,
@@ -1197,7 +958,7 @@ def register_u1_file_pick_session(
     source_input: str,
     files: List[Path],
 ) -> Optional[str]:
-    valid_files = normalize_existing_file_paths(files)
+    valid_files = normalize_existing_paths(files, include_dirs=True)
     if not valid_files:
         return None
 
@@ -1205,7 +966,7 @@ def register_u1_file_pick_session(
     token = secrets.token_hex(4)
     while (
         token in U1_FILE_PICK_SESSIONS
-        or token in GDL_DOWNLOAD_PICK_SESSIONS
+        or token in U1_FOLDER_MODE_SESSIONS
         or token in ARIA2_UPLOAD_JOBS
         or token in ARIA2_PENDING_UPLOAD_CHOICES
     ):
@@ -1227,7 +988,37 @@ def resolve_u1_file_pick_paths(payload: Dict[str, object]) -> List[Path]:
     files_raw = payload.get("files")
     if not isinstance(files_raw, list):
         return []
-    return normalize_existing_file_paths([Path(str(item)) for item in files_raw])
+    return normalize_existing_paths([Path(str(item)) for item in files_raw], include_dirs=True)
+
+
+def register_u1_folder_mode_session(
+    requester_id: Optional[int],
+    target_chat,
+    folder_path: Path,
+    source_input: str,
+) -> Optional[str]:
+    if not folder_path.exists() or not folder_path.is_dir():
+        return None
+
+    cleanup_expired_u1_folder_mode_sessions()
+    token = secrets.token_hex(4)
+    while (
+        token in U1_FOLDER_MODE_SESSIONS
+        or token in U1_FILE_PICK_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+    ):
+        token = secrets.token_hex(4)
+
+    U1_FOLDER_MODE_SESSIONS[token] = {
+        "requester_id": requester_id,
+        "target_chat": target_chat,
+        "folder_path": str(folder_path),
+        "source_input": source_input.strip(),
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
 
 
 def split_text_into_pages(text: str, max_chars: int) -> List[str]:
@@ -1272,6 +1063,101 @@ def cleanup_expired_rclone_output_sessions() -> None:
         RCLONE_OUTPUT_SESSIONS.pop(token, None)
 
 
+def cleanup_expired_extract_pick_sessions() -> None:
+    now = time.time()
+    expired_tokens: List[str] = []
+    for token, payload in EXTRACT_PICK_SESSIONS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        EXTRACT_PICK_SESSIONS.pop(token, None)
+
+
+def cleanup_expired_extract_file_pick_sessions() -> None:
+    now = time.time()
+    expired_tokens: List[str] = []
+    for token, payload in EXTRACT_FILE_PICK_SESSIONS.items():
+        expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at <= now:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+
+
+def register_extract_pick_session(
+    requester_id: Optional[int],
+    source_inputs: List[str],
+    target_dir: Path,
+) -> Optional[str]:
+    normalized_inputs = [str(item).strip() for item in source_inputs if str(item).strip()]
+    if not normalized_inputs:
+        return None
+
+    cleanup_expired_extract_pick_sessions()
+    token = secrets.token_hex(4)
+    while (
+        token in EXTRACT_PICK_SESSIONS
+        or token in EXTRACT_FILE_PICK_SESSIONS
+        or token in RCLONE_OUTPUT_SESSIONS
+        or token in U1_FILE_PICK_SESSIONS
+        or token in U1_FOLDER_MODE_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+    ):
+        token = secrets.token_hex(4)
+
+    EXTRACT_PICK_SESSIONS[token] = {
+        "requester_id": requester_id,
+        "source_inputs": normalized_inputs,
+        "target_dir": str(target_dir),
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
+
+
+def register_extract_file_pick_session(
+    requester_id: Optional[int],
+    extract_mode: str,
+    target_dir: Path,
+    files: List[Path],
+) -> Optional[str]:
+    valid_files = normalize_existing_file_paths(files)
+    if not valid_files:
+        return None
+
+    cleanup_expired_extract_file_pick_sessions()
+    token = secrets.token_hex(4)
+    while (
+        token in EXTRACT_FILE_PICK_SESSIONS
+        or token in EXTRACT_PICK_SESSIONS
+        or token in RCLONE_OUTPUT_SESSIONS
+        or token in U1_FILE_PICK_SESSIONS
+        or token in U1_FOLDER_MODE_SESSIONS
+        or token in ARIA2_UPLOAD_JOBS
+        or token in ARIA2_PENDING_UPLOAD_CHOICES
+    ):
+        token = secrets.token_hex(4)
+
+    EXTRACT_FILE_PICK_SESSIONS[token] = {
+        "requester_id": requester_id,
+        "extract_mode": str(extract_mode).strip().lower(),
+        "target_dir": str(target_dir),
+        "files": [str(item) for item in valid_files],
+        "created_at": time.time(),
+        "expires_at": time.time() + ARIA2_BUTTON_TTL_SECONDS,
+    }
+    return token
+
+
+def resolve_extract_file_pick_paths(payload: Dict[str, object]) -> List[Path]:
+    files_raw = payload.get("files")
+    if not isinstance(files_raw, list):
+        return []
+    return normalize_existing_file_paths([Path(str(item)) for item in files_raw])
+
+
 def register_rclone_output_session(
     requester_id: Optional[int],
     summary_lines: List[str],
@@ -1286,7 +1172,9 @@ def register_rclone_output_session(
     while (
         token in RCLONE_OUTPUT_SESSIONS
         or token in U1_FILE_PICK_SESSIONS
-        or token in GDL_DOWNLOAD_PICK_SESSIONS
+        or token in U1_FOLDER_MODE_SESSIONS
+        or token in EXTRACT_PICK_SESSIONS
+        or token in EXTRACT_FILE_PICK_SESSIONS
         or token in ARIA2_UPLOAD_JOBS
         or token in ARIA2_PENDING_UPLOAD_CHOICES
     ):
@@ -1406,7 +1294,7 @@ def build_u1_file_picker_text(
 ) -> str:
     total_files = len(source_paths)
     if total_files <= 0:
-        return "Tidak ada file valid untuk dipilih."
+        return "Tidak ada path valid untuk dipilih."
 
     page_count = max(1, (total_files + U1_PICKER_PAGE_SIZE - 1) // U1_PICKER_PAGE_SIZE)
     safe_page = max(0, min(int(page), page_count - 1))
@@ -1414,12 +1302,182 @@ def build_u1_file_picker_text(
     end = min(total_files, start + U1_PICKER_PAGE_SIZE)
 
     lines = [
-        "Pilih file untuk /u1.",
+        "Pilih file/folder untuk /u1.",
         f"Input: `{source_input}`",
-        f"Total file: `{total_files}`",
+        f"Total item: `{total_files}`",
         f"Tujuan upload Telegram: `{target_label(target_chat)}`",
         "",
-        "Daftar file:",
+        "Daftar item:",
+    ]
+    for index, source_path in enumerate(source_paths[start:end], start=start + 1):
+        name_text = f"{source_path.name}/" if source_path.is_dir() else source_path.name
+        kind_text = "DIR" if source_path.is_dir() else "FILE"
+        lines.append(f"{index}. `{name_text}` ({kind_text})")
+
+    if page_count > 1:
+        lines.extend(["", f"Halaman: `{safe_page + 1}/{page_count}`"])
+
+    lines.extend(
+        [
+            "",
+            f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
+            "Klik angka untuk pilih file/folder. Jika pilih folder, bot akan minta mode upload folder.",
+        ]
+    )
+    return trim_output("\n".join(lines))
+
+
+def build_u1_folder_mode_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("1. Semua + folder", callback_data=f"u1fmode|{token}|all_with_folder")],
+            [InlineKeyboardButton("2. Semua tanpa folder", callback_data=f"u1fmode|{token}|all_no_folder")],
+            [InlineKeyboardButton("3. Single file", callback_data=f"u1fmode|{token}|single_file")],
+            [InlineKeyboardButton("Batal", callback_data=f"u1fmode|{token}|cancel")],
+        ]
+    )
+
+
+def u1_folder_mode_label(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized == "all_with_folder":
+        return "Upload semua file beserta folder"
+    if normalized == "all_no_folder":
+        return "Upload semua file kecuali folder"
+    if normalized == "single_file":
+        return "Upload single file"
+    return normalized or "unknown"
+
+
+def collect_folder_files(folder_path: Path, recursive: bool) -> Tuple[List[Path], Optional[str]]:
+    if not folder_path.exists():
+        return [], f"Folder tidak ditemukan: `{folder_path}`"
+    if not folder_path.is_dir():
+        return [], f"Path bukan folder: `{folder_path}`"
+
+    collected: List[Path] = []
+    seen = set()
+    try:
+        iterator = folder_path.rglob("*") if recursive else folder_path.iterdir()
+        for item in iterator:
+            try:
+                resolved = item.resolve()
+            except Exception:
+                resolved = item
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(resolved)
+    except Exception as e:
+        return [], str(e)
+
+    collected.sort(key=lambda p: str(p).lower())
+    return collected, None
+
+
+def extract_mode_label(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized == "unrar":
+        return "unrar x"
+    if normalized == "unzip":
+        return "unzip"
+    if normalized == "untar":
+        return "tar -xzf"
+    if normalized == "un7z":
+        return "7z x"
+    return normalized or "unknown"
+
+
+def build_extract_mode_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("unrar", callback_data=f"xpick|{token}|unrar"),
+                InlineKeyboardButton("unzip", callback_data=f"xpick|{token}|unzip"),
+            ],
+            [
+                InlineKeyboardButton("untar", callback_data=f"xpick|{token}|untar"),
+                InlineKeyboardButton("un7z", callback_data=f"xpick|{token}|un7z"),
+            ],
+            [
+                InlineKeyboardButton("Batal", callback_data=f"xpick|{token}|cancel"),
+            ],
+        ]
+    )
+
+
+def build_extract_file_picker_keyboard(
+    token: str,
+    total_files: int,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    safe_total = max(0, int(total_files))
+    if safe_total <= 0:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Batal", callback_data=f"xfile|{token}|cancel")]]
+        )
+
+    page_count = max(1, (safe_total + EXTRACT_PICKER_PAGE_SIZE - 1) // EXTRACT_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(int(page), page_count - 1))
+    start = safe_page * EXTRACT_PICKER_PAGE_SIZE
+    end = min(safe_total, start + EXTRACT_PICKER_PAGE_SIZE)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    current_row: List[InlineKeyboardButton] = []
+    for file_index in range(start, end):
+        current_row.append(
+            InlineKeyboardButton(
+                str(file_index + 1),
+                callback_data=f"xfile|{token}|{file_index}",
+            )
+        )
+        if len(current_row) >= EXTRACT_PICKER_BUTTONS_PER_ROW:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+
+    nav_row: List[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(
+            InlineKeyboardButton("Prev", callback_data=f"xpage|{token}|{safe_page - 1}")
+        )
+    if safe_page < (page_count - 1):
+        nav_row.append(
+            InlineKeyboardButton("Next", callback_data=f"xpage|{token}|{safe_page + 1}")
+        )
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("Batal", callback_data=f"xfile|{token}|cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_extract_file_picker_text(
+    extract_mode: str,
+    target_dir: Path,
+    source_paths: List[Path],
+    page: int = 0,
+) -> str:
+    total_files = len(source_paths)
+    if total_files <= 0:
+        return "Tidak ada arsip valid untuk dipilih."
+
+    page_count = max(1, (total_files + EXTRACT_PICKER_PAGE_SIZE - 1) // EXTRACT_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(int(page), page_count - 1))
+    start = safe_page * EXTRACT_PICKER_PAGE_SIZE
+    end = min(total_files, start + EXTRACT_PICKER_PAGE_SIZE)
+
+    lines = [
+        "Pilih arsip untuk /extract.",
+        f"Mode: `{extract_mode_label(extract_mode)}`",
+        f"Target folder: `{target_dir}`",
+        f"Total arsip cocok: `{total_files}`",
+        "",
+        "Daftar arsip:",
     ]
     for index, source_path in enumerate(source_paths[start:end], start=start + 1):
         lines.append(f"{index}. `{source_path.name}`")
@@ -1431,7 +1489,7 @@ def build_u1_file_picker_text(
         [
             "",
             f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
-            "Klik tombol angka untuk memilih file, lalu pilih tujuan upload (Telegram/rclone).",
+            "Klik angka untuk konfirmasi file yang akan diekstrak.",
         ]
     )
     return trim_output("\n".join(lines))
@@ -2521,9 +2579,8 @@ def resolve_upload_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
     if not is_absolute_or_home:
         candidates.append(str(upload_root / expanded))
 
-    matched_files: List[Path] = []
+    matched_items: List[Path] = []
     seen_paths = set()
-    first_directory = None
     has_pattern = has_wildcard(expanded)
 
     for candidate in candidates:
@@ -2532,31 +2589,26 @@ def resolve_upload_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
             raw_matches = sorted(glob.glob(candidate_expanded, recursive=True))
             for item in raw_matches:
                 resolved = Path(item).resolve()
-                if resolved.is_file():
+                if resolved.exists():
                     key = str(resolved)
                     if key not in seen_paths:
                         seen_paths.add(key)
-                        matched_files.append(resolved)
+                        matched_items.append(resolved)
         else:
             resolved = Path(candidate_expanded).resolve()
             if resolved.exists():
-                if resolved.is_file():
-                    key = str(resolved)
-                    if key not in seen_paths:
-                        seen_paths.add(key)
-                        matched_files.append(resolved)
-                elif first_directory is None:
-                    first_directory = resolved
+                key = str(resolved)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    matched_items.append(resolved)
 
-    if matched_files:
-        return matched_files, None
-
-    if first_directory:
-        return [], f"Path harus file, bukan folder:\n`{first_directory}`"
+    if matched_items:
+        matched_items.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
+        return matched_items, None
 
     if has_pattern:
         return [], (
-            "File tidak ditemukan untuk wildcard.\n"
+            "Path tidak ditemukan untuk wildcard.\n"
             f"Pola: `{path_text}`\n"
             f"Default folder upload: `{upload_root}`"
         )
@@ -2564,12 +2616,12 @@ def resolve_upload_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
     if not is_absolute_or_home:
         fallback_path = (upload_root / expanded).resolve()
         return [], (
-            "File tidak ditemukan.\n"
+            "Path tidak ditemukan.\n"
             f"Input: `{path_text}`\n"
             f"Cek juga: `{fallback_path}`"
         )
 
-    return [], f"File tidak ditemukan:\n`{Path(os.path.expanduser(expanded)).resolve()}`"
+    return [], f"Path tidak ditemukan:\n`{Path(os.path.expanduser(expanded)).resolve()}`"
 
 
 def target_label(chat_id_or_username) -> str:
@@ -2657,6 +2709,206 @@ def compute_path_usage(target_path: Path) -> Tuple[int, int, int, int]:
             error_count += 1
 
     return total_bytes, file_count, dir_count, error_count
+
+
+def build_extract_command(
+    archive_path: Path,
+    target_dir: Path,
+    forced_mode: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    archive_name_lower = archive_path.name.lower()
+    target_dir_text = str(target_dir)
+    selected_mode = str(forced_mode or "").strip().lower()
+    if selected_mode == "untar" or (
+        not selected_mode and archive_name_lower.endswith((".tar.gz", ".tgz"))
+    ):
+        return "tar", ["tar", "-xzf", str(archive_path), "-C", target_dir_text]
+    if selected_mode == "unzip" or (not selected_mode and archive_name_lower.endswith(".zip")):
+        return "unzip", ["unzip", "-o", str(archive_path), "-d", target_dir_text]
+    if selected_mode == "unrar" or (not selected_mode and archive_name_lower.endswith(".rar")):
+        return "unrar", ["unrar", "x", "-o+", "-y", str(archive_path), f"{target_dir_text}{os.sep}"]
+    return "7z", ["7z", "x", str(archive_path), f"-o{target_dir_text}", "-y"]
+
+
+def archive_matches_extract_mode(archive_path: Path, mode: str) -> bool:
+    archive_name_lower = archive_path.name.lower()
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode == "unrar":
+        return archive_name_lower.endswith(".rar")
+    if normalized_mode == "unzip":
+        return archive_name_lower.endswith(".zip")
+    if normalized_mode == "untar":
+        return archive_name_lower.endswith((".tar.gz", ".tgz"))
+    if normalized_mode == "un7z":
+        return archive_name_lower.endswith(".7z")
+    return True
+
+
+def resolve_extract_candidates(source_inputs: List[str]) -> Tuple[List[Path], List[str]]:
+    candidate_paths: List[Path] = []
+    failed_lines: List[str] = []
+    seen_paths = set()
+    for raw_path in source_inputs:
+        targets, resolve_error = resolve_path_candidates(raw_path)
+        if resolve_error:
+            failed_lines.append(f"- `{raw_path}` -> {resolve_error}")
+            continue
+        for target_path in targets:
+            key = str(target_path)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            candidate_paths.append(target_path)
+    return candidate_paths, failed_lines
+
+
+def compact_process_output(stderr_text: str, stdout_text: str, max_chars: int = 220) -> str:
+    raw_output = (stderr_text or stdout_text).strip()
+    if not raw_output:
+        return "tanpa output"
+    compact_text = re.sub(r"\s+", " ", " ".join(raw_output.splitlines())).strip()
+    compact_text = compact_text.replace("`", "'")
+    if len(compact_text) > max_chars:
+        return compact_text[: max_chars - 3] + "..."
+    return compact_text
+
+
+async def execute_extract_operation(
+    command_message,
+    status_message,
+    source_inputs: List[str],
+    extract_mode: str,
+    target_dir: Path,
+) -> None:
+    normalized_mode = str(extract_mode or "").strip().lower()
+    if normalized_mode not in EXTRACT_MODES:
+        await update_status_message(
+            command_message,
+            status_message,
+            f"Mode extract tidak valid: `{extract_mode}`",
+            reply_markup=None,
+        )
+        return
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        await update_status_message(
+            command_message,
+            status_message,
+            "Gagal menyiapkan folder ekstrak.\n"
+            f"Target: `{target_dir}`\n"
+            f"Error: `{e}`",
+            reply_markup=None,
+        )
+        return
+
+    candidate_paths, failed_lines = resolve_extract_candidates(source_inputs)
+    matching_candidates = []
+    skipped_lines = []
+    mode_display = extract_mode_label(normalized_mode)
+    for candidate_path in candidate_paths:
+        if archive_matches_extract_mode(candidate_path, normalized_mode):
+            matching_candidates.append(candidate_path)
+        else:
+            skipped_lines.append(
+                f"- `{candidate_path}` -> tidak cocok mode `{mode_display}`"
+            )
+
+    success_lines = []
+    for archive_path in matching_candidates:
+        if not path_exists_or_symlink(archive_path):
+            failed_lines.append(f"- `{archive_path}` -> path tidak ditemukan")
+            continue
+        if archive_path.is_dir():
+            failed_lines.append(f"- `{archive_path}` -> path harus file arsip, bukan folder")
+            continue
+
+        extractor_name, command = build_extract_command(
+            archive_path,
+            target_dir,
+            forced_mode=normalized_mode,
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            failed_lines.append(
+                f"- `{archive_path}` -> command `{extractor_name}` tidak ditemukan di sistem"
+            )
+            continue
+        except Exception as e:
+            failed_lines.append(f"- `{archive_path}` -> gagal menjalankan `{extractor_name}`: {e}")
+            continue
+
+        timed_out = False
+        try:
+            stdout_raw, stderr_raw = await asyncio.wait_for(
+                process.communicate(),
+                timeout=EXTRACT_COMMAND_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            stdout_raw, stderr_raw = await process.communicate()
+
+        stdout_text = stdout_raw.decode("utf-8", errors="ignore")
+        stderr_text = stderr_raw.decode("utf-8", errors="ignore")
+        if not timed_out and process.returncode == 0:
+            success_lines.append(
+                f"- `{archive_path.name}` -> `{target_dir}` (via `{extractor_name}`)"
+            )
+            continue
+
+        reason = "timeout" if timed_out else f"exit code {process.returncode}"
+        error_excerpt = compact_process_output(stderr_text, stdout_text)
+        failed_lines.append(
+            f"- `{archive_path}` -> `{extractor_name}` gagal ({reason}): {error_excerpt}"
+        )
+
+    summary_lines = [
+        "extract selesai.",
+        f"Mode: `{mode_display}`",
+        f"Target folder: `{target_dir}`",
+        f"Input sumber: `{len(source_inputs)}`",
+        f"Kandidat: `{len(candidate_paths)}`",
+        f"Diproses: `{len(matching_candidates)}`",
+        f"Berhasil: `{len(success_lines)}`",
+        f"Gagal: `{len(failed_lines)}`",
+    ]
+    if skipped_lines:
+        summary_lines.append(f"Diskip (tidak cocok mode): `{len(skipped_lines)}`")
+
+    if success_lines:
+        summary_lines.append("")
+        summary_lines.append("Berhasil:")
+        summary_lines.extend(success_lines[:20])
+        if len(success_lines) > 20:
+            summary_lines.append(f"... {len(success_lines) - 20} arsip lain.")
+
+    if failed_lines:
+        summary_lines.append("")
+        summary_lines.append("Gagal:")
+        summary_lines.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            summary_lines.append(f"... {len(failed_lines) - 20} item lain.")
+
+    if skipped_lines:
+        summary_lines.append("")
+        summary_lines.append("Diskip:")
+        summary_lines.extend(skipped_lines[:10])
+        if len(skipped_lines) > 10:
+            summary_lines.append(f"... {len(skipped_lines) - 10} item lain.")
+
+    await update_status_message(
+        command_message,
+        status_message,
+        trim_output("\n".join(summary_lines)),
+        reply_markup=None,
+    )
 
 
 def remove_file_quietly(path: Optional[Path]) -> None:
@@ -3436,116 +3688,7 @@ async def gallery_dl_download_command(client: Client, message):
         return
 
     source_count = len(source_urls or [])
-    effective_gallery_args = list(gallery_args or [])
-    selected_file_name = ""
-    single_file_mode = False
-    download_scope_label = "Semua file (default)"
-    probe_warning = ""
-    status_message = None
-
-    should_offer_picker = (
-        source_count == 1
-        and bool(source_urls)
-        and is_gofile_source_url(str(source_urls[0]))
-        and not has_gallery_dl_range_option(effective_gallery_args)
-    )
-    if should_offer_picker:
-        probe_entries, probe_warning = await probe_gallery_dl_entries(effective_gallery_args)
-        if len(probe_entries) > 1:
-            picker_token = register_gdl_download_pick_session(
-                requester_id=getattr(message.from_user, "id", None),
-                chat_id=message.chat.id,
-                source_input=str(source_urls[0]),
-                files=probe_entries,
-            )
-            if picker_token:
-                status_message = await open_status_message(
-                    message,
-                    build_gdl_download_picker_text(
-                        source_input=str(source_urls[0]),
-                        files=probe_entries,
-                        page=0,
-                    ),
-                    reply_markup=build_gdl_download_picker_keyboard(
-                        token=picker_token,
-                        total_files=len(probe_entries),
-                        page=0,
-                    ),
-                )
-
-                selected_mode = ""
-                selected_index: Optional[int] = None
-                wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
-                while time.time() < wait_deadline:
-                    picker_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(picker_token)
-                    if not picker_payload:
-                        await update_status_message(
-                            message,
-                            status_message,
-                            "Sesi pilihan file /gdl tidak ditemukan atau sudah kedaluwarsa.",
-                            reply_markup=None,
-                        )
-                        return
-
-                    selected_mode = str(picker_payload.get("selected_mode") or "").strip()
-                    raw_selected_index = picker_payload.get("selected_index")
-                    if selected_mode in {"all", "single", "cancel"}:
-                        if selected_mode == "single":
-                            try:
-                                selected_index = int(raw_selected_index)
-                            except Exception:
-                                selected_index = None
-                        break
-                    await asyncio.sleep(0.5)
-                else:
-                    GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
-                    await update_status_message(
-                        message,
-                        status_message,
-                        "Waktu memilih file /gdl habis. Jalankan `/gdl` lagi.",
-                        reply_markup=None,
-                    )
-                    return
-
-                picker_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(picker_token) or {}
-                picker_entries = resolve_gdl_download_pick_entries(picker_payload)
-                if selected_mode == "cancel":
-                    GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
-                    await update_status_message(
-                        message,
-                        status_message,
-                        "Pemilihan file /gdl dibatalkan.",
-                        reply_markup=None,
-                    )
-                    return
-                if selected_mode == "single":
-                    if (
-                        selected_index is None
-                        or selected_index < 0
-                        or selected_index >= len(picker_entries)
-                    ):
-                        GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
-                        await update_status_message(
-                            message,
-                            status_message,
-                            "Pilihan file /gdl tidak valid.",
-                            reply_markup=None,
-                        )
-                        return
-                    selected_file_name = str(picker_entries[selected_index]).replace("`", "'")
-                    effective_gallery_args = inject_gallery_dl_range_before_urls(
-                        effective_gallery_args,
-                        f"{selected_index + 1}-{selected_index + 1}",
-                    )
-                    single_file_mode = True
-                    download_scope_label = f"Single file #{selected_index + 1}"
-                else:
-                    download_scope_label = "Download All"
-
-                GDL_DOWNLOAD_PICK_SESSIONS.pop(picker_token, None)
-        elif len(probe_entries) == 1:
-            download_scope_label = "Single file (sumber hanya 1 file)"
-    command = [GALLERY_DL_BIN, *effective_gallery_args]
+    command = [GALLERY_DL_BIN, *(gallery_args or [])]
     preselect_token = register_pending_upload_choice(
         requester_id=getattr(message.from_user, "id", None),
         chat_id=message.chat.id,
@@ -3553,34 +3696,15 @@ async def gallery_dl_download_command(client: Client, message):
     )
     preselect_markup = build_aria2_upload_keyboard(preselect_token)
 
-    preselect_lines = [
-        "Permintaan /gdl diterima.",
-        "Pilih tujuan upload dulu lewat tombol di bawah.",
-        "Download baru akan mulai setelah kamu memilih.",
-        "",
-        f"Target folder: `{target_dir}`",
+    status_message = await open_status_message(
+        message,
+        "Permintaan /gdl diterima.\n"
+        "Pilih tujuan upload dulu lewat tombol di bawah.\n"
+        "Download baru akan mulai setelah kamu memilih.\n\n"
+        f"Target folder: `{target_dir}`\n"
         f"Sumber: `{source_count}` URL",
-        f"Mode download: `{download_scope_label}`",
-    ]
-    if selected_file_name:
-        preselect_lines.append(f"File terpilih: `{selected_file_name}`")
-    if probe_warning:
-        preselect_lines.extend(["", probe_warning])
-
-    preselect_text = trim_output("\n".join(preselect_lines))
-    if status_message:
-        status_message = await update_status_message(
-            message,
-            status_message,
-            preselect_text,
-            reply_markup=preselect_markup,
-        )
-    else:
-        status_message = await open_status_message(
-            message,
-            preselect_text,
-            reply_markup=preselect_markup,
-        )
+        reply_markup=preselect_markup,
+    )
 
     selected_action = ""
     wait_deadline = time.time() + ARIA2_BUTTON_TTL_SECONDS
@@ -3616,21 +3740,14 @@ async def gallery_dl_download_command(client: Client, message):
         "tb": "rclone Terabox",
         "skip": "Lewati upload",
     }.get(selected_action, selected_action)
-    start_lines = [
-        "Pilihan upload sudah disimpan.",
-        f"Tujuan: `{action_label}`",
-        "",
-        "Memulai download via gallery-dl...",
-        f"Target folder: `{target_dir}`",
-        f"Sumber: `{source_count}` URL",
-        f"Mode download: `{download_scope_label}`",
-    ]
-    if selected_file_name:
-        start_lines.append(f"File terpilih: `{selected_file_name}`")
     status_message = await update_status_message(
         message,
         status_message,
-        trim_output("\n".join(start_lines)),
+        "Pilihan upload sudah disimpan.\n"
+        f"Tujuan: `{action_label}`\n\n"
+        "Memulai download via gallery-dl...\n"
+        f"Target folder: `{target_dir}`\n"
+        f"Sumber: `{source_count}` URL",
         reply_markup=None,
     )
 
@@ -3689,12 +3806,9 @@ async def gallery_dl_download_command(client: Client, message):
                     f"PID: `{process.pid}`",
                     f"Target folder: `{target_dir}`",
                     f"Sumber URL: `{source_count}`",
-                    f"Mode download: `{download_scope_label}`",
                     f"Elapsed: `{elapsed}`",
                     f"Update terakhir: `{update_age}` lalu",
                 ]
-                if selected_file_name:
-                    progress_lines.append(f"File terpilih: `{selected_file_name}`")
                 raw_line = progress_state.get("line")
                 if raw_line:
                     progress_lines.append("")
@@ -3720,54 +3834,12 @@ async def gallery_dl_download_command(client: Client, message):
             before_snapshot=before_snapshot,
             started_at=started_at,
         )
-        single_cleanup_note = ""
-        if single_file_mode and downloaded_files:
-            preferred_matches = []
-            if selected_file_name:
-                preferred_matches = [
-                    item
-                    for item in downloaded_files
-                    if item.name.strip().lower() == selected_file_name.strip().lower()
-                ]
-                if not preferred_matches:
-                    selected_stem = Path(selected_file_name).stem.strip().lower()
-                    if selected_stem:
-                        preferred_matches = [
-                            item
-                            for item in downloaded_files
-                            if item.stem.strip().lower() == selected_stem
-                        ]
-            selected_path = preferred_matches[0] if preferred_matches else downloaded_files[0]
-            extra_paths = [item for item in downloaded_files if item != selected_path]
-            removed_count = 0
-            failed_remove_count = 0
-            for extra_path in extra_paths:
-                try:
-                    extra_path.unlink()
-                    removed_count += 1
-                except Exception:
-                    failed_remove_count += 1
-            downloaded_files = [selected_path]
-            if removed_count or failed_remove_count:
-                single_cleanup_note = (
-                    f"Single mode cleanup: hapus `{removed_count}` file tambahan"
-                    + (
-                        f", gagal hapus `{failed_remove_count}` file."
-                        if failed_remove_count
-                        else "."
-                    )
-                )
         summary_lines = [
             "gallery-dl selesai.",
             f"Target folder: `{target_dir}`",
             f"Durasi: `{elapsed_text}`",
             f"Return code: `{process.returncode}`",
-            f"Mode download: `{download_scope_label}`",
         ]
-        if selected_file_name:
-            summary_lines.append(f"File terpilih: `{selected_file_name}`")
-        if single_cleanup_note:
-            summary_lines.append(single_cleanup_note)
         if downloaded_files:
             token = register_aria2_upload_job(
                 requester_id=getattr(message.from_user, "id", None),
@@ -3843,10 +3915,7 @@ async def gallery_dl_download_command(client: Client, message):
         f"Target folder: `{target_dir}`",
         f"Durasi: `{elapsed_text}`",
         f"Return code: `{process.returncode}`",
-        f"Mode download: `{download_scope_label}`",
     ]
-    if selected_file_name:
-        failed_lines.append(f"File terpilih: `{selected_file_name}`")
     if stderr_tail:
         failed_lines.append("")
         failed_lines.append("Error gallery-dl (stderr):")
@@ -4048,170 +4117,6 @@ async def rclone_output_page_callback(client: Client, callback_query):
     await callback_query.answer()
 
 
-@app.on_callback_query(filters.regex(r"^gdlpage\|"))
-async def gdl_download_page_callback(client: Client, callback_query):
-    del client
-
-    payload = callback_query.data or ""
-    parts = payload.split("|", 2)
-    if len(parts) != 3:
-        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
-        return
-
-    _, token, page_text = parts
-    try:
-        requested_page = int(page_text)
-    except ValueError:
-        await callback_query.answer("Nomor halaman tidak valid.", show_alert=True)
-        return
-
-    cleanup_expired_gdl_download_pick_sessions()
-    session_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(token)
-    if not session_payload:
-        await callback_query.answer("Pilihan file /gdl sudah kedaluwarsa.", show_alert=True)
-        return
-
-    actor = getattr(callback_query, "from_user", None)
-    requester_id = session_payload.get("requester_id")
-    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
-    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
-        await callback_query.answer("Tombol ini hanya untuk requester /gdl.", show_alert=True)
-        return
-
-    status_message = callback_query.message
-    if not status_message:
-        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
-        return
-
-    entries = resolve_gdl_download_pick_entries(session_payload)
-    if len(entries) <= 1:
-        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
-        await callback_query.answer("Daftar file /gdl tidak tersedia lagi.", show_alert=True)
-        await update_status_message(
-            status_message,
-            status_message,
-            "Pemilihan file /gdl dibatalkan: daftar file tidak tersedia.",
-            reply_markup=None,
-        )
-        return
-
-    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
-    page_count = max(1, (len(entries) + GDL_PICKER_PAGE_SIZE - 1) // GDL_PICKER_PAGE_SIZE)
-    safe_page = max(0, min(requested_page, page_count - 1))
-    source_input = str(session_payload.get("source_input") or "").strip()
-    await update_status_message(
-        status_message,
-        status_message,
-        build_gdl_download_picker_text(
-            source_input=source_input,
-            files=entries,
-            page=safe_page,
-        ),
-        reply_markup=build_gdl_download_picker_keyboard(
-            token=token,
-            total_files=len(entries),
-            page=safe_page,
-        ),
-    )
-    await callback_query.answer()
-
-
-@app.on_callback_query(filters.regex(r"^gdlpick\|"))
-async def gdl_download_pick_callback(client: Client, callback_query):
-    del client
-
-    payload = callback_query.data or ""
-    parts = payload.split("|", 2)
-    if len(parts) != 3:
-        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
-        return
-
-    _, token, pick_value = parts
-    cleanup_expired_gdl_download_pick_sessions()
-    session_payload = GDL_DOWNLOAD_PICK_SESSIONS.get(token)
-    if not session_payload:
-        await callback_query.answer("Pilihan file /gdl sudah kedaluwarsa.", show_alert=True)
-        return
-
-    actor = getattr(callback_query, "from_user", None)
-    requester_id = session_payload.get("requester_id")
-    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
-    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
-        await callback_query.answer("Tombol ini hanya untuk requester /gdl.", show_alert=True)
-        return
-
-    status_message = callback_query.message
-    if not status_message:
-        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
-        return
-
-    entries = resolve_gdl_download_pick_entries(session_payload)
-    if len(entries) <= 1:
-        GDL_DOWNLOAD_PICK_SESSIONS.pop(token, None)
-        await callback_query.answer("Daftar file /gdl tidak tersedia lagi.", show_alert=True)
-        await update_status_message(
-            status_message,
-            status_message,
-            "Pemilihan file /gdl dibatalkan: daftar file tidak tersedia.",
-            reply_markup=None,
-        )
-        return
-
-    if pick_value == "cancel":
-        session_payload["selected_mode"] = "cancel"
-        session_payload["selected_index"] = None
-        session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
-        await callback_query.answer("Pemilihan file /gdl dibatalkan.")
-        await update_status_message(
-            status_message,
-            status_message,
-            "Pemilihan file /gdl dibatalkan.",
-            reply_markup=None,
-        )
-        return
-
-    if pick_value == "all":
-        session_payload["selected_mode"] = "all"
-        session_payload["selected_index"] = None
-        session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
-        await callback_query.answer("Download All dipilih.")
-        await update_status_message(
-            status_message,
-            status_message,
-            "Pilihan file /gdl tersimpan.\nMode: `Download All`.\nMenunggu proses berikutnya...",
-            reply_markup=None,
-        )
-        return
-
-    try:
-        selected_index = int(pick_value)
-    except ValueError:
-        await callback_query.answer("Nomor file tidak valid.", show_alert=True)
-        return
-
-    if selected_index < 0 or selected_index >= len(entries):
-        await callback_query.answer("Nomor file di luar daftar.", show_alert=True)
-        return
-
-    selected_name = entries[selected_index]
-    safe_name = str(selected_name).replace("`", "'")
-    session_payload["selected_mode"] = "single"
-    session_payload["selected_index"] = selected_index
-    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
-
-    await callback_query.answer(f"File #{selected_index + 1} dipilih.")
-    await update_status_message(
-        status_message,
-        status_message,
-        "Pilihan file /gdl tersimpan.\n"
-        "Mode: `Single file`\n"
-        f"Nomor: `{selected_index + 1}`\n"
-        f"Nama: `{safe_name}`\n"
-        "Menunggu proses berikutnya...",
-        reply_markup=None,
-    )
-
-
 @app.on_callback_query(filters.regex(r"^u1page\|"))
 async def u1_file_page_callback(client: Client, callback_query):
     del client
@@ -4346,6 +4251,40 @@ async def u1_file_pick_callback(client: Client, callback_query):
 
     selected_path = source_paths[selected_index]
     target_chat = session_payload.get("target_chat", status_message.chat.id)
+    if selected_path.is_dir():
+        folder_mode_token = register_u1_folder_mode_session(
+            requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+            target_chat=target_chat,
+            folder_path=selected_path,
+            source_input=str(selected_path),
+        )
+        U1_FILE_PICK_SESSIONS.pop(token, None)
+        if not folder_mode_token:
+            await callback_query.answer("Gagal menyiapkan mode folder.", show_alert=True)
+            await update_status_message(
+                status_message,
+                status_message,
+                "Folder dipilih, tetapi sesi mode folder gagal dibuat.",
+                reply_markup=None,
+            )
+            return
+
+        await callback_query.answer(f"Folder #{selected_index + 1} dipilih.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Folder /u1 dipilih.\n"
+            f"Nomor: `{selected_index + 1}`\n"
+            f"Folder: `{selected_path}`\n"
+            f"Target Telegram: `{target_label(target_chat)}`\n\n"
+            "Pilih mode upload folder:\n"
+            "1. Upload semua file beserta folder\n"
+            "2. Upload semua file kecuali folder\n"
+            "3. Upload single file",
+            reply_markup=build_u1_folder_mode_keyboard(folder_mode_token),
+        )
+        return
+
     upload_token = register_aria2_upload_job(
         requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
         requester_name=telegram_user_display_name(actor),
@@ -4378,6 +4317,579 @@ async def u1_file_pick_callback(client: Client, callback_query):
         "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox.\n"
         f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
         reply_markup=build_aria2_upload_keyboard(upload_token),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^u1fmode\|"))
+async def u1_folder_mode_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, mode = parts
+    cleanup_expired_u1_folder_mode_sessions()
+    session_payload = U1_FOLDER_MODE_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Mode folder /u1 sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /u1.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    if mode == "cancel":
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Pemilihan mode folder dibatalkan.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan mode folder /u1 dibatalkan.",
+            reply_markup=None,
+        )
+        return
+
+    valid_modes = {"all_with_folder", "all_no_folder", "single_file"}
+    if mode not in valid_modes:
+        await callback_query.answer("Mode folder tidak dikenal.", show_alert=True)
+        return
+
+    folder_path_raw = str(session_payload.get("folder_path") or "").strip()
+    if not folder_path_raw:
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Folder sumber tidak tersedia.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Folder sumber /u1 tidak tersedia lagi.",
+            reply_markup=None,
+        )
+        return
+
+    try:
+        folder_path = local_path_from_text(folder_path_raw)
+    except Exception as e:
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Path folder tidak valid.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            f"Path folder /u1 tidak valid: `{e}`",
+            reply_markup=None,
+        )
+        return
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Folder tidak ditemukan.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            f"Folder /u1 tidak ditemukan:\n`{folder_path}`",
+            reply_markup=None,
+        )
+        return
+
+    target_chat = session_payload.get("target_chat", status_message.chat.id)
+    source_input = str(session_payload.get("source_input") or folder_path).strip()
+
+    if mode == "all_with_folder":
+        source_paths, collect_error = collect_folder_files(folder_path, recursive=True)
+    elif mode == "all_no_folder":
+        source_paths, collect_error = collect_folder_files(folder_path, recursive=False)
+    else:
+        source_paths, collect_error = collect_folder_files(folder_path, recursive=True)
+
+    if collect_error:
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Gagal membaca isi folder.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            f"Gagal membaca folder /u1:\n`{collect_error}`",
+            reply_markup=None,
+        )
+        return
+
+    if not source_paths:
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        await callback_query.answer("Tidak ada file di folder.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Folder tidak berisi file yang bisa diupload.",
+            reply_markup=None,
+        )
+        return
+
+    if mode == "single_file":
+        picker_token = register_u1_file_pick_session(
+            requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+            command_chat_id=status_message.chat.id,
+            target_chat=target_chat,
+            source_input=source_input,
+            files=source_paths,
+        )
+        U1_FOLDER_MODE_SESSIONS.pop(token, None)
+        if not picker_token:
+            await callback_query.answer("Gagal menyiapkan daftar file.", show_alert=True)
+            await update_status_message(
+                status_message,
+                status_message,
+                "Gagal menyiapkan daftar file untuk mode single file.",
+                reply_markup=None,
+            )
+            return
+
+        picker_payload = U1_FILE_PICK_SESSIONS.get(picker_token)
+        if not picker_payload:
+            await callback_query.answer("Sesi pemilihan file tidak ditemukan.", show_alert=True)
+            await update_status_message(
+                status_message,
+                status_message,
+                "Sesi pemilihan file /u1 tidak ditemukan.",
+                reply_markup=None,
+            )
+            return
+
+        prepared_paths = [item for item in resolve_u1_file_pick_paths(picker_payload) if item.is_file()]
+        if not prepared_paths:
+            U1_FILE_PICK_SESSIONS.pop(picker_token, None)
+            await callback_query.answer("File tidak tersedia lagi.", show_alert=True)
+            await update_status_message(
+                status_message,
+                status_message,
+                "File sumber tidak tersedia lagi untuk mode single file.",
+                reply_markup=None,
+            )
+            return
+
+        picker_payload["files"] = [str(path) for path in prepared_paths]
+        await callback_query.answer("Mode single file dipilih.")
+        await update_status_message(
+            status_message,
+            status_message,
+            build_u1_file_picker_text(
+                source_input=source_input,
+                target_chat=target_chat,
+                source_paths=prepared_paths,
+                page=0,
+            ),
+            reply_markup=build_u1_file_picker_keyboard(
+                token=picker_token,
+                total_files=len(prepared_paths),
+                page=0,
+            ),
+        )
+        return
+
+    upload_token = register_aria2_upload_job(
+        requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+        requester_name=telegram_user_display_name(actor),
+        chat_id=target_chat,
+        files=source_paths,
+        target_dir=folder_path,
+        source_label="u1",
+    )
+    U1_FOLDER_MODE_SESSIONS.pop(token, None)
+    if not upload_token:
+        await callback_query.answer("Gagal menyiapkan sesi upload.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Gagal menyiapkan sesi upload untuk mode folder.",
+            reply_markup=None,
+        )
+        return
+
+    mode_text = u1_folder_mode_label(mode)
+    await callback_query.answer(f"Mode dipilih: {mode_text}")
+    await update_status_message(
+        status_message,
+        status_message,
+        "Mode folder /u1 dipilih.\n"
+        f"Mode: `{mode_text}`\n"
+        f"Folder: `{folder_path}`\n"
+        f"Total file: `{len(source_paths)}`\n"
+        f"Target Telegram: `{target_label(target_chat)}`\n\n"
+        "Pilih upload lanjutan via tombol: Telegram / rclone Google Drive / rclone Terabox.\n"
+        f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
+        reply_markup=build_aria2_upload_keyboard(upload_token),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^xpick\|"))
+async def extract_mode_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, action = parts
+    cleanup_expired_extract_pick_sessions()
+    session_payload = EXTRACT_PICK_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Pilihan extract sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /extract.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    if action == "cancel":
+        EXTRACT_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Menu /extract dibatalkan.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Menu /extract dibatalkan.",
+            reply_markup=None,
+        )
+        return
+
+    if action not in EXTRACT_MODES:
+        await callback_query.answer("Mode extract tidak dikenal.", show_alert=True)
+        return
+
+    source_inputs_raw = session_payload.get("source_inputs")
+    source_inputs = (
+        [str(item).strip() for item in source_inputs_raw if str(item).strip()]
+        if isinstance(source_inputs_raw, list)
+        else []
+    )
+    if not source_inputs:
+        EXTRACT_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Input arsip tidak tersedia.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Input arsip /extract tidak tersedia lagi.",
+            reply_markup=None,
+        )
+        return
+
+    target_dir_raw = str(session_payload.get("target_dir") or str(extract_root)).strip()
+    try:
+        target_dir = local_path_from_text(target_dir_raw)
+    except Exception:
+        target_dir = extract_root
+
+    EXTRACT_PICK_SESSIONS.pop(token, None)
+    candidate_paths, resolve_errors = resolve_extract_candidates(source_inputs)
+    matching_files: List[Path] = []
+    skipped_lines: List[str] = []
+    mode_display = extract_mode_label(action)
+    for candidate_path in candidate_paths:
+        if not archive_matches_extract_mode(candidate_path, action):
+            continue
+        if not path_exists_or_symlink(candidate_path):
+            skipped_lines.append(f"- `{candidate_path}` -> path tidak ditemukan")
+            continue
+        if candidate_path.is_dir():
+            skipped_lines.append(f"- `{candidate_path}` -> bukan file arsip")
+            continue
+        matching_files.append(candidate_path)
+
+    if not matching_files:
+        summary_lines = [
+            "Tidak ada arsip yang cocok untuk mode terpilih.",
+            f"Mode: `{mode_display}`",
+            f"Target folder: `{target_dir}`",
+            f"Sumber input: `{len(source_inputs)}`",
+            f"Kandidat: `{len(candidate_paths)}`",
+            f"Cocok: `0`",
+        ]
+        if resolve_errors:
+            summary_lines.append("")
+            summary_lines.append("Error input:")
+            summary_lines.extend(resolve_errors[:10])
+            if len(resolve_errors) > 10:
+                summary_lines.append(f"... {len(resolve_errors) - 10} error lain.")
+        if skipped_lines:
+            summary_lines.append("")
+            summary_lines.append("Diskip:")
+            summary_lines.extend(skipped_lines[:10])
+            if len(skipped_lines) > 10:
+                summary_lines.append(f"... {len(skipped_lines) - 10} item lain.")
+        await callback_query.answer("Tidak ada file untuk mode ini.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            trim_output("\n".join(summary_lines)),
+            reply_markup=None,
+        )
+        return
+
+    picker_token = register_extract_file_pick_session(
+        requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
+        extract_mode=action,
+        target_dir=target_dir,
+        files=matching_files,
+    )
+    if not picker_token:
+        await callback_query.answer("Gagal menyiapkan daftar file.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Gagal menyiapkan daftar file /extract.",
+            reply_markup=None,
+        )
+        return
+
+    picker_payload = EXTRACT_FILE_PICK_SESSIONS.get(picker_token)
+    if not picker_payload:
+        await callback_query.answer("Sesi pemilihan file tidak ditemukan.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Sesi pemilihan file /extract tidak ditemukan.",
+            reply_markup=None,
+        )
+        return
+
+    prepared_paths = resolve_extract_file_pick_paths(picker_payload)
+    if not prepared_paths:
+        EXTRACT_FILE_PICK_SESSIONS.pop(picker_token, None)
+        await callback_query.answer("Arsip tidak tersedia lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Arsip sumber /extract tidak tersedia lagi saat membuat tombol pilihan.",
+            reply_markup=None,
+        )
+        return
+
+    picker_payload["files"] = [str(path) for path in prepared_paths]
+    picker_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+
+    note_lines = []
+    if resolve_errors:
+        note_lines.append(f"Catatan: `{len(resolve_errors)}` input tidak valid.")
+    if skipped_lines:
+        note_lines.append(f"Catatan: `{len(skipped_lines)}` kandidat diskip.")
+    picker_text = build_extract_file_picker_text(
+        extract_mode=action,
+        target_dir=target_dir,
+        source_paths=prepared_paths,
+        page=0,
+    )
+    if note_lines:
+        picker_text = trim_output(f"{picker_text}\n\n" + "\n".join(note_lines))
+
+    await callback_query.answer(f"Mode {mode_display} dipilih.")
+    await update_status_message(
+        status_message,
+        status_message,
+        picker_text,
+        reply_markup=build_extract_file_picker_keyboard(
+            token=picker_token,
+            total_files=len(prepared_paths),
+            page=0,
+        ),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^xpage\|"))
+async def extract_file_page_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, page_text = parts
+    try:
+        requested_page = int(page_text)
+    except ValueError:
+        await callback_query.answer("Nomor halaman tidak valid.", show_alert=True)
+        return
+
+    cleanup_expired_extract_file_pick_sessions()
+    session_payload = EXTRACT_FILE_PICK_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Pilihan file /extract sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /extract.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    source_paths = resolve_extract_file_pick_paths(session_payload)
+    if not source_paths:
+        EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Arsip sumber tidak tersedia lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /extract dibatalkan: arsip sumber sudah tidak tersedia.",
+            reply_markup=None,
+        )
+        return
+
+    extract_mode = str(session_payload.get("extract_mode") or "").strip().lower()
+    target_dir_raw = str(session_payload.get("target_dir") or str(extract_root)).strip()
+    try:
+        target_dir = local_path_from_text(target_dir_raw)
+    except Exception:
+        target_dir = extract_root
+
+    session_payload["files"] = [str(path) for path in source_paths]
+    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+    page_count = max(1, (len(source_paths) + EXTRACT_PICKER_PAGE_SIZE - 1) // EXTRACT_PICKER_PAGE_SIZE)
+    safe_page = max(0, min(requested_page, page_count - 1))
+
+    await update_status_message(
+        status_message,
+        status_message,
+        build_extract_file_picker_text(
+            extract_mode=extract_mode,
+            target_dir=target_dir,
+            source_paths=source_paths,
+            page=safe_page,
+        ),
+        reply_markup=build_extract_file_picker_keyboard(
+            token=token,
+            total_files=len(source_paths),
+            page=safe_page,
+        ),
+    )
+    await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^xfile\|"))
+async def extract_file_pick_callback(client: Client, callback_query):
+    del client
+
+    payload = callback_query.data or ""
+    parts = payload.split("|", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Data tombol tidak valid.", show_alert=True)
+        return
+
+    _, token, pick_value = parts
+    cleanup_expired_extract_file_pick_sessions()
+    session_payload = EXTRACT_FILE_PICK_SESSIONS.get(token)
+    if not session_payload:
+        await callback_query.answer("Pilihan file /extract sudah kedaluwarsa.", show_alert=True)
+        return
+
+    actor = getattr(callback_query, "from_user", None)
+    requester_id = session_payload.get("requester_id")
+    owner_override = bool(BOT_MODE and OWNER_USER_ID and actor and actor.id == OWNER_USER_ID)
+    if isinstance(requester_id, int) and actor and actor.id != requester_id and not owner_override:
+        await callback_query.answer("Tombol ini hanya untuk requester /extract.", show_alert=True)
+        return
+
+    status_message = callback_query.message
+    if not status_message:
+        await callback_query.answer("Pesan tombol tidak ditemukan.", show_alert=True)
+        return
+
+    if pick_value == "cancel":
+        EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Pemilihan file /extract dibatalkan.")
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /extract dibatalkan.",
+            reply_markup=None,
+        )
+        return
+
+    try:
+        selected_index = int(pick_value)
+    except ValueError:
+        await callback_query.answer("Nomor file tidak valid.", show_alert=True)
+        return
+
+    source_paths = resolve_extract_file_pick_paths(session_payload)
+    if not source_paths:
+        EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Arsip sumber tidak tersedia lagi.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Pemilihan file /extract dibatalkan: arsip sumber sudah tidak tersedia.",
+            reply_markup=None,
+        )
+        return
+
+    extract_mode = str(session_payload.get("extract_mode") or "").strip().lower()
+    if extract_mode not in EXTRACT_MODES:
+        EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+        await callback_query.answer("Mode extract tidak valid.", show_alert=True)
+        await update_status_message(
+            status_message,
+            status_message,
+            "Mode extract pada sesi tidak valid.",
+            reply_markup=None,
+        )
+        return
+
+    target_dir_raw = str(session_payload.get("target_dir") or str(extract_root)).strip()
+    try:
+        target_dir = local_path_from_text(target_dir_raw)
+    except Exception:
+        target_dir = extract_root
+
+    session_payload["expires_at"] = time.time() + ARIA2_BUTTON_TTL_SECONDS
+    if selected_index < 0 or selected_index >= len(source_paths):
+        await callback_query.answer("Nomor file di luar daftar.", show_alert=True)
+        return
+
+    selected_path = source_paths[selected_index]
+    EXTRACT_FILE_PICK_SESSIONS.pop(token, None)
+
+    await callback_query.answer(f"File #{selected_index + 1} dipilih.")
+    await update_status_message(
+        status_message,
+        status_message,
+        "Memproses ekstrak arsip...\n"
+        f"Mode: `{extract_mode_label(extract_mode)}`\n"
+        f"Nomor: `{selected_index + 1}`\n"
+        f"Nama: `{selected_path.name}`\n"
+        f"Sumber: `{selected_path}`\n"
+        f"Target folder: `{target_dir}`",
+        reply_markup=None,
+    )
+    await execute_extract_operation(
+        command_message=status_message,
+        status_message=status_message,
+        source_inputs=[str(selected_path)],
+        extract_mode=extract_mode,
+        target_dir=target_dir,
     )
 
 
@@ -4443,7 +4955,7 @@ async def upload_command(client: Client, message):
     if not picker_token:
         await open_status_message(
             message,
-            "Gagal menyiapkan daftar file /u1. Pastikan file masih ada dan bisa diakses.",
+            "Gagal menyiapkan daftar path /u1. Pastikan file/folder masih ada dan bisa diakses.",
         )
         return
 
@@ -4457,7 +4969,7 @@ async def upload_command(client: Client, message):
         U1_FILE_PICK_SESSIONS.pop(picker_token, None)
         await open_status_message(
             message,
-            "File sumber /u1 tidak tersedia lagi saat membuat tombol pilihan.",
+            "Path sumber /u1 tidak tersedia lagi saat membuat tombol pilihan.",
         )
         return
 
@@ -5367,6 +5879,70 @@ async def move_command(client: Client, message):
     await open_status_message(message, trim_output("\n".join(summary_lines)))
 
 
+@app.on_message(command_filter("extract"))
+async def extract_archive_command(client: Client, message):
+    del client
+
+    if not await require_owner_or_whitelist_access(message, "extract"):
+        return
+
+    args = command_args(message)
+    source_inputs = [str(item).strip() for item in args if str(item).strip()]
+    reply_message = message.reply_to_message
+    if not source_inputs and reply_message:
+        replied_text = (reply_message.text or reply_message.caption or "").strip()
+        if replied_text:
+            source_inputs = [replied_text]
+
+    used_default_source = False
+    if not source_inputs:
+        source_inputs = [str(extract_root / "*")]
+        used_default_source = True
+
+    picker_token = register_extract_pick_session(
+        requester_id=getattr(message.from_user, "id", None),
+        source_inputs=source_inputs,
+        target_dir=extract_root,
+    )
+    if not picker_token:
+        await open_status_message(
+            message,
+            "Gagal menyiapkan menu /extract.\n"
+            "Coba kirim ulang dengan path arsip, contoh:\n"
+            "`/extract /home/runner/downloads/sample.rar`",
+        )
+        return
+
+    source_preview = ", ".join(f"`{item}`" for item in source_inputs[:3])
+    if len(source_inputs) > 3:
+        source_preview += f", +{len(source_inputs) - 3} item lain"
+
+    menu_lines = [
+        "Menu extract siap.",
+        f"Target folder: `{extract_root}`",
+        f"Sumber arsip: {source_preview}",
+        "",
+        "Pilih mode extract:",
+        "- `unrar` (unrar x)",
+        "- `unzip` (unzip -o)",
+        "- `untar` (tar -xzf)",
+        "- `un7z` (7z x)",
+        "- Setelah pilih mode, pilih file via tombol angka (maks 10 file/halaman).",
+        "",
+        f"Masa berlaku tombol: `{format_duration(ARIA2_BUTTON_TTL_SECONDS)}`.",
+    ]
+    if used_default_source:
+        menu_lines.append(
+            f"Catatan: tanpa argumen, default sumber = `{extract_root / '*'}`."
+        )
+
+    await open_status_message(
+        message,
+        trim_output("\n".join(menu_lines)),
+        reply_markup=build_extract_mode_keyboard(picker_token),
+    )
+
+
 if __name__ == "__main__":
     runtime_mode = "BOT TOKEN" if BOT_MODE else "USERBOT SESSION"
     print(f"Manual downloader aktif. Mode: {runtime_mode}")
@@ -5378,23 +5954,23 @@ if __name__ == "__main__":
         print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /ps /aria2 (/a2) /gdl (/gallerydl) /u1.")
         print("2. Untuk /d1: reply file/video/link t.me + /d1, atau langsung /d1 <link t.me>.")
         print("3. Cek antrian download: /dstatus atau /dqueue.")
-        print("4. Khusus whitelist/owner (`PKILL_ADMIN_IDS` atau OWNER_USER_ID): /pkill /rclone /ls /rm /du /df /copy (/cp) /mv.")
+        print("4. Khusus whitelist/owner (`PKILL_ADMIN_IDS` atau OWNER_USER_ID): /pkill /rclone /ls /rm /du /df /copy (/cp) /mv /extract.")
         print("5. Khusus owner bot (OWNER_USER_ID): /ucancel /mkdir.")
     elif BOT_MODE:
         print("1. Command private tetap hanya owner (OWNER_USER_ID).")
-        print("2. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv untuk user whitelist `PKILL_ADMIN_IDS` (owner juga bisa).")
+        print("2. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv /extract untuk user whitelist `PKILL_ADMIN_IDS` (owner juga bisa).")
         print("3. Public command nonaktif. Aktifkan PUBLIC_MODE=1 untuk membuka /d1 /dstatus /dqueue /ps /aria2 /gdl /u1.")
     elif PUBLIC_MODE:
         print("1. Di chat/group, semua member bisa pakai: /d1 /dstatus /dqueue /ps /aria2 (/a2) /gdl (/gallerydl) /u1.")
         print("2. Untuk /d1: reply file/video/link t.me + /d1, atau langsung /d1 <link t.me>.")
         print("3. Cek antrian download: /dstatus atau /dqueue.")
-        print("4. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv hanya untuk whitelist `PKILL_ADMIN_IDS` (atau owner).")
+        print("4. /pkill /rclone /ls /rm /du /df /copy (/cp) /mv /extract hanya untuk whitelist `PKILL_ADMIN_IDS` (atau owner).")
         print("5. Command owner (Saved Messages): /ucancel /mkdir.")
     else:
         print("1. Forward file/video ATAU kirim link t.me ke Saved Messages.")
         print("2. Reply pesan tersebut dengan /d1, atau kirim /d1 <link t.me>.")
         print("3. Cek antrian download: /dstatus atau /dqueue.")
-        print("4. Upload file lokal: /u1 /path/file, /u1 *.txt, /u1 /path/*.mp4 --to @username, atau cukup /u1 (default folder upload).")
+        print("4. Upload lokal: /u1 /path/file, /u1 /path/folder, /u1 *.txt, /u1 /path/*.mp4 --to @username, atau cukup /u1 (default folder upload).")
     print("- Download external via aria2: /aria2 <url|magnet> (default folder DOWNLOAD_DIR)")
     print("- Di /d1, bot hanya download ke lokal (tanpa tombol upload).")
     print("- Di /aria2, wajib pilih tujuan upload dulu; download baru dimulai setelah pilihan dibuat.")
@@ -5402,8 +5978,8 @@ if __name__ == "__main__":
     print("- Download via gallery-dl (contoh GoFile): /gdl https://gofile.io/d/xxxxx  (default: -d /home/runner/downloads -o directory=\"\")")
     print("- Override manual tetap bisa: /gdl -d /path/target -o directory=\"\" https://gofile.io/d/xxxxx")
     print("- /aria2 dan /gdl juga bisa dipakai sambil reply link direct (http/https/ftp)")
-    print("- Di /u1, bot menampilkan daftar file + tombol angka; pilih satu file dulu sebelum tombol upload tampil.")
-    print(f"- Jika /u1 tanpa argumen, default pola file: `{upload_root / '*'}`")
+    print("- Di /u1, bot menampilkan daftar file/folder + tombol angka; jika pilih folder akan muncul 3 mode (semua+folder, semua tanpa folder, single file).")
+    print(f"- Jika /u1 tanpa argumen, default pola path: `{upload_root / '*'}`")
     print("- Hasil /d1 bisa diupload manual pakai /u1 <path_file>; upload sukses akan hapus file lokal.")
     print("- Untuk /aria2 dan /gdl: jika pilih tujuan upload, bot auto-upload; jika pilih Lewati, upload lanjutan tidak dijalankan.")
     print("- Jika upload gagal, gunakan tombol `Retry Terakhir` atau pilih tujuan upload lagi")
@@ -5422,6 +5998,7 @@ if __name__ == "__main__":
     )
     print("- Manajemen file: /mkdir <path> (owner)")
     print("- Copy/move: /copy|/cp <source> <target>, /mv <source> <target> [whitelist/owner]")
+    print("- Ekstrak arsip: /extract [path_arsip] -> pilih mode lalu pilih file via tombol angka (10 file/halaman, Prev/Next) ke /home/runner/downloads [whitelist/owner]")
     print("- Hapus file/folder: /rm [opsi] <path> (mis. /rm -rf /path) [whitelist/owner]")
     print(f"- File download disimpan ke: {download_root}")
     print(f"- Default folder upload: {upload_root}")
