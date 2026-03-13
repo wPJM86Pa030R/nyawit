@@ -866,6 +866,7 @@ def register_aria2_upload_job(
     target_dir: Optional[Path] = None,
     source_label: str = "aria2",
     token: Optional[str] = None,
+    rclone_relative_base: Optional[Path] = None,
 ) -> Optional[str]:
     valid_files = normalize_existing_file_paths(files)
     if not valid_files:
@@ -885,6 +886,12 @@ def register_aria2_upload_job(
         base_dir_text = str(base_dir.resolve())
     except Exception:
         base_dir_text = str(base_dir)
+    rclone_relative_base_text = ""
+    if rclone_relative_base is not None:
+        try:
+            rclone_relative_base_text = str(rclone_relative_base.resolve())
+        except Exception:
+            rclone_relative_base_text = str(rclone_relative_base)
 
     ARIA2_UPLOAD_JOBS[resolved_token] = {
         "requester_id": requester_id,
@@ -892,6 +899,7 @@ def register_aria2_upload_job(
         "chat_id": chat_id,
         "files": [str(path) for path in valid_files],
         "target_dir": base_dir_text,
+        "rclone_relative_base": rclone_relative_base_text,
         "source_label": source_label,
         "last_action": None,
         "created_at": time.time(),
@@ -1678,11 +1686,38 @@ async def send_download_result_notification(
         pass
 
 
+def normalize_rclone_relative_path(path_text: str) -> str:
+    cleaned = str(path_text or "").replace("\\", "/").strip()
+    if not cleaned:
+        return ""
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.lstrip("/")
+    segments = [segment for segment in cleaned.split("/") if segment and segment not in {".", ".."}]
+    return "/".join(segments)
+
+
+def resolve_rclone_upload_path(source_path: Path, relative_base: Optional[Path]) -> str:
+    if relative_base is not None:
+        try:
+            relative_path = source_path.resolve().relative_to(relative_base.resolve())
+            relative_text = normalize_rclone_relative_path(str(relative_path))
+            if relative_text:
+                return relative_text
+        except Exception:
+            pass
+    fallback = normalize_rclone_relative_path(source_path.name)
+    return fallback or source_path.name
+
+
 def build_rclone_destination(remote_base: str, file_name: str) -> str:
+    normalized_name = normalize_rclone_relative_path(file_name)
+    if not normalized_name:
+        normalized_name = normalize_rclone_relative_path(Path(str(file_name)).name) or "unnamed"
     base = remote_base.strip()
     if base.endswith(":") or base.endswith("/"):
-        return f"{base}{file_name}"
-    return f"{base}/{file_name}"
+        return f"{base}{normalized_name}"
+    return f"{base}/{normalized_name}"
 
 
 def summarize_process_error(stdout_raw: bytes, stderr_raw: bytes, return_code: int) -> str:
@@ -1814,6 +1849,7 @@ async def upload_files_via_rclone(
     source_paths: List[Path],
     remote_base: str,
     remote_label: str,
+    relative_base: Optional[Path] = None,
 ) -> Tuple[object, List[str], List[str], List[Path]]:
     success_lines: List[str] = []
     failed_lines: List[str] = []
@@ -1821,13 +1857,14 @@ async def upload_files_via_rclone(
     total_files = len(source_paths)
 
     for index, source_path in enumerate(source_paths, start=1):
-        destination = build_rclone_destination(remote_base, source_path.name)
+        relative_item_path = resolve_rclone_upload_path(source_path, relative_base)
+        destination = build_rclone_destination(remote_base, relative_item_path)
         status_message = await update_status_message(
             command_message,
             status_message,
             "Rclone upload berjalan\n"
             f"File: `{index}/{total_files}`\n"
-            f"Nama: `{source_path.name}`\n"
+            f"Nama: `{relative_item_path}`\n"
             f"Sumber: `{source_path}`\n"
             f"Tujuan: `{destination}`\n"
             f"Remote: `{remote_label}`"
@@ -1851,12 +1888,12 @@ async def upload_files_via_rclone(
             )
         except FileNotFoundError:
             failed_lines.append(
-                f"- `{source_path.name}` -> binary `{RCLONE_BIN}` tidak ditemukan."
+                f"- `{relative_item_path}` -> binary `{RCLONE_BIN}` tidak ditemukan."
             )
             failed_paths.extend(source_paths[index - 1 :])
             break
         except Exception as e:
-            failed_lines.append(f"- `{source_path.name}` -> gagal menjalankan rclone: {e}")
+            failed_lines.append(f"- `{relative_item_path}` -> gagal menjalankan rclone: {e}")
             failed_paths.append(source_path)
             continue
 
@@ -1865,14 +1902,14 @@ async def upload_files_via_rclone(
             delete_error = remove_local_file_after_upload(source_path)
             if delete_error:
                 success_lines.append(
-                    f"- `{source_path.name}` -> `{destination}` "
+                    f"- `{relative_item_path}` -> `{destination}` "
                     f"(upload OK, hapus lokal gagal: `{delete_error}`)"
                 )
             else:
-                success_lines.append(f"- `{source_path.name}` -> `{destination}` (lokal dihapus)")
+                success_lines.append(f"- `{relative_item_path}` -> `{destination}` (lokal dihapus)")
         else:
             reason = summarize_process_error(stdout_raw, stderr_raw, process.returncode)
-            failed_lines.append(f"- `{source_path.name}` -> {reason}")
+            failed_lines.append(f"- `{relative_item_path}` -> {reason}")
             failed_paths.append(source_path)
 
     return status_message, success_lines, failed_lines, normalize_existing_file_paths(failed_paths)
@@ -1897,6 +1934,13 @@ async def execute_upload_action_for_token(
         source_paths = resolve_aria2_job_files(job_payload)
     else:
         source_paths = normalize_existing_file_paths(source_paths)
+    rclone_relative_base: Optional[Path] = None
+    rclone_relative_base_raw = str(job_payload.get("rclone_relative_base") or "").strip()
+    if rclone_relative_base_raw:
+        try:
+            rclone_relative_base = local_path_from_text(rclone_relative_base_raw)
+        except Exception:
+            rclone_relative_base = None
 
     source_label = str(job_payload.get("source_label") or "aria2").strip() or "aria2"
     source_title = source_label
@@ -2072,6 +2116,7 @@ async def execute_upload_action_for_token(
             source_paths=source_paths,
             remote_base=remote_base,
             remote_label=remote_label,
+            relative_base=rclone_relative_base,
         )
         summary_text = build_upload_summary(
             summary_title=f"Upload hasil {source_title} via rclone {remote_label} selesai.",
@@ -4762,6 +4807,7 @@ async def u1_folder_mode_callback(client: Client, callback_query):
         )
         return
 
+    rclone_relative_base = folder_path.parent if mode == "all_with_folder" else None
     upload_token = register_aria2_upload_job(
         requester_id=requester_id if isinstance(requester_id, int) else getattr(actor, "id", None),
         requester_name=telegram_user_display_name(actor),
@@ -4769,6 +4815,7 @@ async def u1_folder_mode_callback(client: Client, callback_query):
         files=source_paths,
         target_dir=folder_path,
         source_label="u1",
+        rclone_relative_base=rclone_relative_base,
     )
     U1_FOLDER_MODE_SESSIONS.pop(token, None)
     if not upload_token:
