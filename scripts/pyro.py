@@ -424,7 +424,7 @@ def parse_disk_command_target(command_name: str, args: List[str]) -> Tuple[Optio
             # Contoh: /du -h, /df --si, dst.
             continue
         path_parts.append(arg)
-    return " ".join(path_parts).strip() or ".", None
+    return " ".join(path_parts).strip() or "/home", None
 
 
 def parse_aria2_command_args(
@@ -5812,7 +5812,7 @@ async def list_command(client: Client, message):
             continue
         path_parts.append(arg)
 
-    path_text = " ".join(path_parts).strip() or "."
+    path_text = " ".join(path_parts).strip() or str(download_root)
     try:
         target_path = local_path_from_text(path_text)
     except Exception as e:
@@ -6410,8 +6410,13 @@ if __name__ == "__main__":
         f"Terabox=`{RCLONE_TERABOX_REMOTE or '(belum diatur)'}`, "
         f"Dropbox=`{RCLONE_DROPBOX_REMOTE or '(belum diatur)'}`"
     )
-    print("- Cek isi direktori: /ls [opsi] [path] (mis. /ls -lh /path, /ls --all /path) [whitelist/owner]")
-    print("- Cek disk: /du [opsi] [path] dan /df [opsi] [path] (opsi diterima utk kompatibilitas) [whitelist/owner]")
+    print(
+        f"- Cek isi direktori: /ls [opsi] [path] (mis. /ls -lh /path, /ls --all /path; default: {download_root}) [whitelist/owner]"
+    )
+    print(
+        "- Cek disk: /du [opsi] [path] dan /df [opsi] [path] "
+        "(opsi diterima utk kompatibilitas, default: /home) [whitelist/owner]"
+    )
     print("- Batalkan upload yang sedang berjalan: /ucancel")
     print("- Cek proses: /ps <nama_proses|pid>  (public jika PUBLIC_MODE=1, contoh: /ps aria2)")
     print("- Admin whitelist: /pkill <pattern> (opsional signal: /pkill --signal TERM <pattern>)")
