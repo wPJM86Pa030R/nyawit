@@ -9,6 +9,9 @@ import json
 import glob
 import tempfile
 import secrets
+import html
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -128,6 +131,26 @@ EXTERNAL_LINK_RE = re.compile(
     r"(magnet:\?[^\s]+|https?://[^\s<>\"'`]+|ftp://[^\s<>\"'`]+)",
     re.IGNORECASE,
 )
+MEDIAFIRE_DOWNLOAD_BUTTON_RE = re.compile(
+    r'id=(?P<quote>["\'])downloadButton(?P=quote)[^>]*href=(?P<hquote>["\'])(?P<href>.+?)(?P=hquote)',
+    re.IGNORECASE | re.DOTALL,
+)
+MEDIAFIRE_DOWNLOAD_BUTTON_TAG_RE = re.compile(
+    r"<a[^>]*id=(?P<quote>[\"'])downloadButton(?P=quote)[^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+MEDIAFIRE_TAG_HREF_RE = re.compile(
+    r'href=(?P<quote>["\'])(?P<href>.+?)(?P=quote)',
+    re.IGNORECASE | re.DOTALL,
+)
+MEDIAFIRE_DIRECT_HREF_RE = re.compile(
+    r'href=(?P<quote>["\'])(?P<href>https?://(?:download[^"\']*\.mediafire\.com/[^"\']+|(?:www\.)?mediafire\.com/download/[^"\']+))(?P=quote)',
+    re.IGNORECASE,
+)
+MEDIAFIRE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -164,7 +187,8 @@ EXTRACT_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
 EXTRACT_FILE_PICK_SESSIONS: Dict[str, Dict[str, object]] = {}
 EXTRACT_DELETE_CONFIRM_SESSIONS: Dict[str, Dict[str, object]] = {}
 
-EXTRACT_MODES = ("unrar", "unzip", "untar", "un7z")
+EXTRACT_ARCHIVE_SUFFIXES = (".rar", ".zip", ".tar.gz", ".tgz", ".7z")
+EXTRACT_MODES = ("all", "unrar", "unzip", "untar", "un7z")
 
 
 def command_filter(name: str, allow_public: bool = False):
@@ -257,6 +281,113 @@ def is_direct_url(value: str) -> bool:
         return False
     cleaned = value.strip()
     return cleaned.lower().startswith(("http://", "https://", "ftp://"))
+
+
+def compact_single_line(value: object, max_chars: int = 140) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(cleaned) > max_chars:
+        return cleaned[: max_chars - 3] + "..."
+    return cleaned
+
+
+def url_host(value: str) -> str:
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    host = (parsed.netloc or "").strip().lower()
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host
+
+
+def is_mediafire_url(value: str) -> bool:
+    if not is_direct_url(value):
+        return False
+    host = url_host(value)
+    return host == "mediafire.com" or host == "mfi.re" or host.endswith(".mediafire.com")
+
+
+def extract_mediafire_download_href(page_html: str) -> Optional[str]:
+    button_tag_match = MEDIAFIRE_DOWNLOAD_BUTTON_TAG_RE.search(page_html or "")
+    if button_tag_match:
+        href_match = MEDIAFIRE_TAG_HREF_RE.search(button_tag_match.group(0))
+        if href_match:
+            return href_match.group("href").strip()
+
+    button_match = MEDIAFIRE_DOWNLOAD_BUTTON_RE.search(page_html or "")
+    if button_match:
+        return button_match.group("href").strip()
+
+    direct_match = MEDIAFIRE_DIRECT_HREF_RE.search(page_html or "")
+    if direct_match:
+        return direct_match.group("href").strip()
+    return None
+
+
+def resolve_mediafire_direct_url(raw_url: str, timeout_seconds: int = 20) -> Tuple[Optional[str], Optional[str]]:
+    cleaned_url = str(raw_url or "").strip()
+    if not cleaned_url:
+        return None, "URL kosong."
+    if not is_mediafire_url(cleaned_url):
+        return cleaned_url, None
+
+    request = urllib.request.Request(
+        cleaned_url,
+        headers={
+            "User-Agent": MEDIAFIRE_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.mediafire.com/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            final_url = response.geturl()
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "text/html" not in content_type and final_url:
+                return final_url, None
+            page_html = response.read(1_500_000).decode("utf-8", errors="ignore")
+    except Exception as e:
+        return None, f"Gagal membuka halaman MediaFire: {compact_single_line(e)}"
+
+    href = extract_mediafire_download_href(page_html)
+    if not href:
+        final_path = urllib.parse.urlparse(final_url).path.lower()
+        if "/download/" in final_path:
+            return final_url, None
+        return None, "Link direct tidak ditemukan pada halaman MediaFire."
+
+    unescaped_href = html.unescape(href).replace("\\/", "/").replace("\\u0026", "&")
+    resolved_url = urllib.parse.urljoin(final_url, unescaped_href).strip()
+    if not is_direct_url(resolved_url):
+        return None, "Link hasil parsing MediaFire tidak valid."
+    return resolved_url, None
+
+
+async def resolve_aria2_source_urls(urls: List[str]) -> Tuple[List[str], List[str]]:
+    resolved_urls: List[str] = []
+    notes: List[str] = []
+    for raw_url in urls:
+        cleaned = str(raw_url or "").strip()
+        if not cleaned:
+            continue
+
+        if not is_mediafire_url(cleaned):
+            resolved_urls.append(cleaned)
+            continue
+
+        direct_url, resolve_error = await asyncio.to_thread(resolve_mediafire_direct_url, cleaned)
+        if direct_url:
+            resolved_urls.append(direct_url)
+            if direct_url != cleaned:
+                notes.append(f"- MediaFire: `{cleaned}` -> direct URL ditemukan.")
+            continue
+
+        resolved_urls.append(cleaned)
+        notes.append(
+            f"- MediaFire: `{cleaned}` -> gagal resolve direct link "
+            f"({compact_single_line(resolve_error or 'unknown error')}), lanjut pakai URL asli."
+        )
+    return resolved_urls, notes
 
 
 def has_downloadable_media(message) -> bool:
@@ -1448,6 +1579,8 @@ def collect_folder_files(folder_path: Path, recursive: bool) -> Tuple[List[Path]
 
 def extract_mode_label(mode: str) -> str:
     normalized = str(mode or "").strip().lower()
+    if normalized == "all":
+        return "semua (auto)"
     if normalized == "unrar":
         return "unrar x"
     if normalized == "unzip":
@@ -1462,6 +1595,9 @@ def extract_mode_label(mode: str) -> str:
 def build_extract_mode_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("all (auto)", callback_data=f"xpick|{token}|all"),
+            ],
             [
                 InlineKeyboardButton("unrar", callback_data=f"xpick|{token}|unrar"),
                 InlineKeyboardButton("unzip", callback_data=f"xpick|{token}|unzip"),
@@ -2649,6 +2785,10 @@ def resolve_path_candidates(path_text: str) -> Tuple[List[Path], Optional[str]]:
     candidate = os.path.expanduser(expanded)
 
     if has_wildcard(candidate):
+        literal_candidate = Path(candidate).resolve()
+        if path_exists_or_symlink(literal_candidate):
+            return [literal_candidate], None
+
         raw_matches = sorted(glob.glob(candidate, recursive=True))
         if not raw_matches:
             return [], f"Wildcard tidak cocok: `{path_text}`"
@@ -2703,17 +2843,25 @@ def resolve_upload_sources(path_text: str) -> Tuple[List[Path], Optional[str]]:
     for candidate in candidates:
         candidate_expanded = os.path.expanduser(candidate)
         if has_wildcard(candidate_expanded):
+            literal_candidate = Path(candidate_expanded).resolve()
+            if path_exists_or_symlink(literal_candidate):
+                key = str(literal_candidate)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    matched_items.append(literal_candidate)
+                continue
+
             raw_matches = sorted(glob.glob(candidate_expanded, recursive=True))
             for item in raw_matches:
                 resolved = Path(item).resolve()
-                if resolved.exists():
+                if path_exists_or_symlink(resolved):
                     key = str(resolved)
                     if key not in seen_paths:
                         seen_paths.add(key)
                         matched_items.append(resolved)
         else:
             resolved = Path(candidate_expanded).resolve()
-            if resolved.exists():
+            if path_exists_or_symlink(resolved):
                 key = str(resolved)
                 if key not in seen_paths:
                     seen_paths.add(key)
@@ -2836,6 +2984,8 @@ def build_extract_command(
     archive_name_lower = archive_path.name.lower()
     target_dir_text = str(target_dir)
     selected_mode = str(forced_mode or "").strip().lower()
+    if selected_mode == "all":
+        selected_mode = ""
     if selected_mode == "untar" or (
         not selected_mode and archive_name_lower.endswith((".tar.gz", ".tgz"))
     ):
@@ -2847,9 +2997,15 @@ def build_extract_command(
     return "7z", ["7z", "x", str(archive_path), f"-o{target_dir_text}", "-y"]
 
 
+def is_supported_extract_archive(archive_path: Path) -> bool:
+    return archive_path.name.lower().endswith(EXTRACT_ARCHIVE_SUFFIXES)
+
+
 def archive_matches_extract_mode(archive_path: Path, mode: str) -> bool:
     archive_name_lower = archive_path.name.lower()
     normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode == "all":
+        return is_supported_extract_archive(archive_path)
     if normalized_mode == "unrar":
         return archive_name_lower.endswith(".rar")
     if normalized_mode == "unzip":
@@ -2858,7 +3014,7 @@ def archive_matches_extract_mode(archive_path: Path, mode: str) -> bool:
         return archive_name_lower.endswith((".tar.gz", ".tgz"))
     if normalized_mode == "un7z":
         return archive_name_lower.endswith(".7z")
-    return True
+    return is_supported_extract_archive(archive_path)
 
 
 def resolve_extract_candidates(source_inputs: List[str]) -> Tuple[List[Path], List[str]]:
@@ -3365,7 +3521,7 @@ def build_help_topic_text(topic: str) -> Optional[str]:
     if not normalized_topic:
         return None
 
-    if normalized_topic in {"extract", "x", "unrar", "unzip", "untar", "un7z"}:
+    if normalized_topic in {"extract", "x", "all", "unrar", "unzip", "untar", "un7z"}:
         return trim_output(
             "\n".join(
                 [
@@ -3378,7 +3534,8 @@ def build_help_topic_text(topic: str) -> Optional[str]:
                     "`/extract /home/runner/downloads/sample.rar`",
                     "",
                     "Alur:",
-                    "1. Pilih mode extract (`unrar`, `unzip`, `untar`, `un7z`).",
+                    "1. Pilih mode extract (`all`, `unrar`, `unzip`, `untar`, `un7z`).",
+                    "   `all` = auto pilih extractor sesuai ekstensi arsip.",
                     "2. Pilih file via tombol angka (maks 10 file/halaman, Prev/Next).",
                     "3. Setelah ekstrak sukses, bot tanya apakah file arsip sumber ingin dihapus.",
                 ]
@@ -3399,6 +3556,7 @@ def build_help_topic_text(topic: str) -> Optional[str]:
                     "",
                     "Catatan:",
                     "- Bisa dipakai sambil reply pesan yang berisi link direct (http/https/ftp).",
+                    "- Link halaman MediaFire akan di-resolve otomatis ke direct URL sebelum dikirim ke aria2.",
                     "- Setelah kirim command, pilih tujuan upload dulu (Telegram/rclone/Lewati), baru download jalan.",
                 ]
             )
@@ -3660,6 +3818,10 @@ async def aria2_download_command(client: Client, message):
         await open_status_message(message, parse_error)
         return
 
+    resolver_notes: List[str] = []
+    if urls:
+        urls, resolver_notes = await resolve_aria2_source_urls(urls)
+
     if not target_dir:
         await open_status_message(message, "Folder target tidak valid.")
         return
@@ -3690,9 +3852,22 @@ async def aria2_download_command(client: Client, message):
         "--console-log-level=warn",
         "--file-allocation=none",
     ]
+    if any(is_mediafire_url(item) for item in (urls or [])):
+        command.extend(
+            [
+                "--header",
+                "Referer: https://www.mediafire.com/",
+                "--header",
+                f"User-Agent: {MEDIAFIRE_USER_AGENT}",
+            ]
+        )
     if output_name:
         command.extend(["--out", output_name])
     command.extend(urls or [])
+
+    resolver_note_text = ""
+    if resolver_notes:
+        resolver_note_text = f"\nResolver MediaFire: `{len(resolver_notes)}` catatan"
 
     status_message = await open_status_message(
         message,
@@ -3700,7 +3875,8 @@ async def aria2_download_command(client: Client, message):
         "Pilih tujuan upload dulu lewat tombol di bawah.\n"
         "Download baru akan mulai setelah kamu memilih.\n\n"
         f"Target folder: `{target_dir}`\n"
-        f"Sumber: `{len(urls or [])}` item",
+        f"Sumber: `{len(urls or [])}` item"
+        f"{resolver_note_text}",
         reply_markup=preselect_markup,
     )
 
@@ -3746,7 +3922,8 @@ async def aria2_download_command(client: Client, message):
         f"Tujuan: `{action_label}`\n\n"
         "Memulai download via aria2...\n"
         f"Target folder: `{target_dir}`\n"
-        f"Sumber: `{len(urls or [])}` item",
+        f"Sumber: `{len(urls or [])}` item"
+        f"{resolver_note_text}",
         reply_markup=None,
     )
 
@@ -3868,6 +4045,13 @@ async def aria2_download_command(client: Client, message):
             f"Durasi: `{elapsed_text}`",
             f"Return code: `{process.returncode}`",
         ]
+        if resolver_notes:
+            summary_lines.append(f"Resolver MediaFire: `{len(resolver_notes)}` catatan")
+            summary_lines.append("")
+            summary_lines.append("Catatan resolver:")
+            summary_lines.extend(resolver_notes[:5])
+            if len(resolver_notes) > 5:
+                summary_lines.append(f"... {len(resolver_notes) - 5} catatan lain.")
         if output_name:
             summary_lines.append(f"Output name: `{output_name}`")
         if downloaded_files:
@@ -3946,6 +4130,13 @@ async def aria2_download_command(client: Client, message):
         f"Durasi: `{elapsed_text}`",
         f"Return code: `{process.returncode}`",
     ]
+    if resolver_notes:
+        failed_lines.append(f"Resolver MediaFire: `{len(resolver_notes)}` catatan")
+        failed_lines.append("")
+        failed_lines.append("Catatan resolver:")
+        failed_lines.extend(resolver_notes[:5])
+        if len(resolver_notes) > 5:
+            failed_lines.append(f"... {len(resolver_notes) - 5} catatan lain.")
     if stderr_tail:
         failed_lines.append("")
         failed_lines.append("Error aria2 (stderr):")
@@ -6344,6 +6535,7 @@ async def extract_archive_command(client: Client, message):
         f"Sumber arsip: {source_preview}",
         "",
         "Pilih mode extract:",
+        "- `all` (auto pilih: unrar/unzip/untar/un7z)",
         "- `unrar` (unrar x)",
         "- `unzip` (unzip -o)",
         "- `untar` (tar -xzf)",
@@ -6426,7 +6618,7 @@ if __name__ == "__main__":
     )
     print("- Manajemen file: /mkdir <path> (owner)")
     print("- Copy/move: /copy|/cp <source> <target>, /mv <source> <target> [whitelist/owner]")
-    print("- Ekstrak arsip: /extract [path_arsip] -> pilih mode lalu pilih file via tombol angka (10 file/halaman, Prev/Next) ke /home/runner/downloads [whitelist/owner]")
+    print("- Ekstrak arsip: /extract [path_arsip] -> pilih mode (`all`/`unrar`/`unzip`/`untar`/`un7z`) lalu pilih file via tombol angka (10 file/halaman, Prev/Next) ke /home/runner/downloads [whitelist/owner]")
     print("- Hapus file/folder: /rm [opsi] <path> (mis. /rm -rf /path) [whitelist/owner]")
     print(f"- File download disimpan ke: {download_root}")
     print(f"- Default folder upload: {upload_root}")
