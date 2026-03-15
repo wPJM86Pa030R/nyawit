@@ -4,13 +4,13 @@ on:
   push:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */5 * * *'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 358
+    timeout-minutes: 298
     env:
       API_ID: ${{ secrets.API_ID }}
       API_HASH: ${{ secrets.API_HASH }}
